@@ -85,6 +85,8 @@ temp/
 # Audio temp files
 # (keep audio.mp3 since it's part of your project structure)
 temp_audio/
+sessions/
+uploads/
 # FAISS index backups (keep the main index)
 faiss_index/backup/
 
