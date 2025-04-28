@@ -326,26 +326,23 @@ def create_qa_chain(db):
         search_kwargs={"k": 5, "fetch_k": 15, "lambda_mult": 0.7},
     )
     system_prompt = """
-You are an AI assistant analyzing documents. Based on the provided context:{context}
+Based on the following information from the documents:{context}
 
-Answer the question: {input}
+Please answer this question: {input}
 
-Please follow these guidelines:
-1. Provide a clear, concise response based on the document content
-2. Write in a conversational, human-like style
-3. Include [AI Assistant] at the beginning of your response so users know it's from you
-
-Citation rules:
-1. Use numbered citations like [1], [2] when referring to specific information from documents
-2. Only cite information that appears in the provided documents
-3. Don't use citations for general knowledge
-4. Include a "REFERENCES" section at the end listing all sources cited:
+IMPORTANT INSTRUCTIONS FOR CITATIONS:
+1. ONLY cite information that comes directly from the provided documents.
+2. When referencing information FROM THE DOCUMENTS, use numbered citations like [1], [2], etc.
+3. DO NOT use citations when providing general knowledge that isn't in the documents.
+4. After your answer, include a "REFERENCES:" section that lists all sources you cited.
+5. Each reference should correspond to a specific document chunk and follow this format:
    [number] -> Document: [filename], Chunk: [chunk_number]
-   Include page number if available: [number] -> Document: [filename], Page: [page], Chunk: [chunk_number]
+   If page information is available, include it: [number] -> Document: [filename], Page: [page], Chunk: [chunk_number]
 
-If the documents don't contain information about the question:
-1. State clearly "The provided documents don't contain information about this topic"
-2. You may provide a brief general answer without citations
+If the provided documents don't contain information related to the question:
+1. Clearly state "The provided documents don't contain information about this topic."
+2. You may then provide a brief general answer WITHOUT using any citations.
+3. Do not fabricate citations for general knowledge.
 """
 
     prompt = ChatPromptTemplate.from_messages([
