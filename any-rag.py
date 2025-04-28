@@ -25,6 +25,16 @@ from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from docx import Document as DocxDocument
 
+# Document loader imports
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    TextLoader,
+    UnstructuredWordDocumentLoader,
+    UnstructuredRTFLoader,
+    DirectoryLoader,
+    UnstructuredFileLoader
+)
+
 # Flask imports
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -59,7 +69,7 @@ CORS(app)  # Enable CORS for all routes
 
 # Configure file upload settings
 UPLOAD_FOLDER = os.path.join(os.getcwd(), 'uploads')
-ALLOWED_EXTENSIONS = {'pdf', 'txt', 'docx', 'mp3', 'mp4'}
+ALLOWED_EXTENSIONS = {'pdf', 'txt', 'docx', 'doc', 'rtf', 'mp3', 'mp4'}
 MAX_CONTENT_LENGTH = 100 * 1024 * 1024  # 100MB limit
 
 # Create uploads directory if it doesn't exist
@@ -74,6 +84,91 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
 # Session storage for RAG instances
 active_sessions = {}
+
+# ---------------------
+# Document Loaders
+# ---------------------
+def get_loader_mapping():
+    """Return mapping of file extensions to document loaders."""
+    return {
+        ".pdf": PyPDFLoader,
+        ".txt": TextLoader,
+        ".docx": UnstructuredWordDocumentLoader,
+        ".doc": UnstructuredWordDocumentLoader,
+        ".rtf": UnstructuredRTFLoader,
+        # Audio/video files are handled separately
+        ".mp3": None,
+        ".mp4": None,
+        # Default loader for other file types
+        "default": UnstructuredFileLoader
+    }
+
+def load_single_document(file_path: str) -> list:
+    """Load a single document using appropriate loader"""
+    file_ext = os.path.splitext(file_path)[1].lower()
+    file_name = os.path.basename(file_path)
+    
+    # Handle audio/video files with transcription
+    if file_ext in ['.mp3', '.mp4']:
+        transcription = transcribe_audio(file_path)
+        doc = Document(page_content=transcription, metadata={'source_file': file_name})
+        return [doc]
+    
+    # Handle YouTube URLs
+    elif "youtube.com" in file_path or "youtu.be" in file_path:
+        audio_path = download_audio_from_youtube(file_path)
+        transcription = transcribe_audio(audio_path)
+        doc = Document(page_content=transcription, metadata={'source_file': os.path.basename(audio_path)})
+        return [doc]
+    
+    # Handle regular files
+    loader_mapping = get_loader_mapping()
+    try:
+        if file_ext in loader_mapping and loader_mapping[file_ext]:
+            loader_class = loader_mapping[file_ext]
+            print(f"Loading {file_ext} file: {file_path}")
+            loader = loader_class(file_path)
+            documents = loader.load()
+        else:
+            # Try with default loader for unknown file types
+            print(f"Attempting to load with default loader: {file_path}")
+            loader = loader_mapping["default"](file_path)
+            documents = loader.load()
+        
+        # Add source filename to metadata
+        for doc in documents:
+            if not hasattr(doc, 'metadata'):
+                doc.metadata = {}
+            doc.metadata['source_file'] = file_name
+            # Ensure chunk identification
+            if 'page' not in doc.metadata:
+                doc.metadata['page'] = doc.metadata.get('page_number', 'N/A')
+            
+        print(f"Successfully loaded {len(documents)} document(s) from {file_path}")
+        return documents
+    except Exception as e:
+        print(f"Error loading {file_path}: {str(e)}")
+        return []
+
+def load_multiple_documents(file_paths: list) -> list:
+    """Load multiple documents from a list of file paths"""
+    all_documents = []
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit load tasks
+        future_to_path = {executor.submit(load_single_document, path): path for path in file_paths}
+        
+        # Process results as they complete
+        for future in future_to_path:
+            path = future_to_path[future]
+            try:
+                docs = future.result()
+                all_documents.extend(docs)
+            except Exception as e:
+                print(f"Error processing {path}: {str(e)}")
+    
+    print(f"Loaded {len(all_documents)} total documents from {len(file_paths)} files")
+    return all_documents
 
 # ---------------------
 # Embedding Helper with Caching
@@ -102,62 +197,6 @@ def make_embedder(lightweight=False):
     return get_embedder(lightweight, device)
 
 # ---------------------
-# Optimized File Reader
-# ---------------------
-@lru_cache(maxsize=8)
-def read_file_content(file_path: str) -> str:
-    """Cache file reading results to avoid re-reading"""
-    mime_type, _ = mimetypes.guess_type(file_path)
-
-    if file_path.endswith(".pdf"):
-        try:
-            # Use optimized PDF reading
-            return read_pdf_optimized(file_path)
-        except Exception as e:
-            print(f"Error with optimized PDF reader: {e}. Falling back to standard.")
-            with open(file_path, "rb") as f:
-                reader = PdfReader(f)
-                return "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
-
-    elif file_path.endswith(".docx"):
-        doc = DocxDocument(file_path)
-        return "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-
-    elif file_path.endswith(".txt"):
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
-
-    elif file_path.endswith(".mp3") or file_path.endswith(".mp4"):
-        return transcribe_audio(file_path)
-
-    elif "youtube.com" in file_path or "youtu.be" in file_path:
-        audio_path = download_audio_from_youtube(file_path)
-        return transcribe_audio(audio_path)
-
-    else:
-        raise ValueError(f"Unsupported file type: {file_path}")
-
-def read_pdf_optimized(file_path: str) -> str:
-    """More efficient PDF reading using parallel processing for multi-page PDFs"""
-    with open(file_path, "rb") as f:
-        reader = PdfReader(f)
-        if len(reader.pages) <= 5:  # For small PDFs, don't parallelize
-            return "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
-        
-        # For larger PDFs, use parallel processing
-        def extract_page_text(page_num):
-            try:
-                text = reader.pages[page_num].extract_text()
-                return text if text else ""
-            except Exception:
-                return ""
-        
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            texts = list(executor.map(extract_page_text, range(len(reader.pages))))
-        
-        return "\n".join(text for text in texts if text)
-
-# ---------------------
 # YouTube + Audio Handling 
 # ---------------------
 def download_audio_from_youtube(url: str, output_path: str = None):
@@ -176,30 +215,49 @@ def transcribe_audio(file_path: str):
 # ---------------------
 # Optimized Vector DB Creation
 # ---------------------
-def create_vector_db(text: str, session_id: str, batch_size=BATCH_SIZE):
-    """Create vector database with optimized splitting and parallel embedding"""
-    # Adjust chunk size based on text length for better retrieval
-    if len(text) > 1000000:  # For very large texts
+def create_vector_db(documents: list, session_id: str, batch_size=BATCH_SIZE):
+    """Create vector database from documents with optimized splitting and parallel embedding"""
+    print(f"Processing {len(documents)} documents for vectorization")
+    
+    # Determine chunk size based on total document length
+    total_text_length = sum(len(doc.page_content) for doc in documents)
+    
+    if total_text_length > 1000000:  # For very large documents
         chunk_size = 1500
         chunk_overlap = 150
     else:
         chunk_size = 500
         chunk_overlap = 50
     
-    # Create documents
+    # Split text into chunks
+    print(f"Splitting documents with chunk_size={chunk_size}, chunk_overlap={chunk_overlap}")
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    documents = splitter.split_documents([Document(page_content=text)])
-    print(f"✅ Split into {len(documents)} chunks.")
     
-    # Use lightweight embedder for very large documents
-    use_lightweight = len(documents) > 500
+    # Process each document separately to preserve metadata
+    all_chunks = []
+    for i, doc in enumerate(documents):
+        chunks = splitter.split_documents([doc])
+        # Add chunk number to each split
+        for j, chunk in enumerate(chunks):
+            chunk.metadata['chunk_number'] = j + 1  # 1-indexed for user-friendly reference
+            chunk.metadata['total_chunks'] = len(chunks)
+            # Make sure source file is preserved
+            if 'source_file' not in chunk.metadata:
+                chunk.metadata['source_file'] = doc.metadata.get('source_file', f'doc-{i}')
+        all_chunks.extend(chunks)
+    
+    chunks = all_chunks
+    print(f"✅ Split into {len(chunks)} chunks.")
+    
+    # Use lightweight embedder for very large document sets
+    use_lightweight = len(chunks) > 500
     embedder = make_embedder(lightweight=use_lightweight)
     
     # Process in parallel batches for large document sets
-    if len(documents) > 200:
-        db = create_vector_db_parallel(documents, embedder, batch_size)
+    if len(chunks) > 200:
+        db = create_vector_db_parallel(chunks, embedder, batch_size)
     else:
-        db = FAISS.from_documents(documents, embedder)
+        db = FAISS.from_documents(chunks, embedder)
     
     # Save the database to the session folder
     os.makedirs(os.path.join(SESSION_FOLDER, session_id), exist_ok=True)
@@ -259,51 +317,6 @@ def load_vector_db(session_id: str):
     return None
 
 # ---------------------
-# Process Large Files with Chunking
-# ---------------------
-def process_large_file(file_path: str, session_id: str, max_segment_size=500000):
-    """Process very large files by segmenting and processing in parallel"""
-    content = read_file_content(file_path)
-    
-    if len(content) <= max_segment_size:
-        # If content is not that large, process normally
-        return create_vector_db(content, session_id)
-    
-    # Create segments
-    segments = [content[i:i+max_segment_size] 
-                for i in range(0, len(content), max_segment_size)]
-    print(f"📚 Large file detected. Split into {len(segments)} segments")
-    
-    # Create empty database for merging
-    db = None
-    lightweight_embedder = make_embedder(lightweight=True)
-    
-    # Process segments with progress tracking
-    for i, segment in enumerate(segments):
-        print(f"🔄 Processing segment {i+1}/{len(segments)}")
-        
-        # Create vector database for this segment
-        segment_docs = RecursiveCharacterTextSplitter(
-            chunk_size=1500, chunk_overlap=150
-        ).split_documents([Document(page_content=segment)])
-        
-        # Process in batches
-        if db is None:
-            db = FAISS.from_documents(segment_docs, lightweight_embedder)
-        else:
-            segment_db = FAISS.from_documents(segment_docs, lightweight_embedder)
-            db.merge_from(segment_db)
-        
-        # Force cleanup
-        gc.collect()
-        time.sleep(0.5)  # Give system time to free memory
-    
-    # Save the database to the session folder
-    os.makedirs(os.path.join(SESSION_FOLDER, session_id), exist_ok=True)
-    db.save_local(os.path.join(SESSION_FOLDER, session_id, "faiss_index"))
-    return db
-
-# ---------------------
 # QA Chain (RAG)
 # ---------------------
 def create_qa_chain(db):
@@ -312,27 +325,28 @@ def create_qa_chain(db):
         search_type="mmr",  # Use Maximum Marginal Relevance for better diversity
         search_kwargs={"k": 5, "fetch_k": 15, "lambda_mult": 0.7},
     )
-    system_prompt =    """You are a helpful assistant answering questions about a document.
-        
-        INSTRUCTIONS:
-        1. FIRST, carefully examine the context below and use it to answer the question.
-        2. If the complete answer is found in the context, provide it in clear paragraphs.
-        3. If the context contains partial information:
-           a. Provide what you can from the context
-           b. THEN supplement with your general knowledge to complete the answer
-           c. Clearly mark which parts are from context vs. your knowledge with: [FROM CONTEXT] and [FROM MY KNOWLEDGE]
-        4. If the context doesn't contain ANY information related to the question:
-           a. Indicate this clearly: "The document doesn't address this question."
-           b. THEN provide a helpful answer using your knowledge that relates to the document's topic
-           c. Suggest specific search terms the user might try for more information
-        5. Always prioritize information from the context, but don't leave the user without a helpful answer.
-        6. Keep your answers focused on topics related to the document.
-        7. Include citations at the end of each paragraph in square brackets, not inline. For example: [page 5, lines 10-15]
-        8. Group related information into cohesive paragraphs with citations at the end rather than after each sentence.
-        
-        Context:
-        {context}
-        """
+    system_prompt = """
+You are an AI assistant analyzing documents. Based on the provided context:{context}
+
+Answer the question: {input}
+
+Please follow these guidelines:
+1. Provide a clear, concise response based on the document content
+2. Write in a conversational, human-like style
+3. Include [AI Assistant] at the beginning of your response so users know it's from you
+
+Citation rules:
+1. Use numbered citations like [1], [2] when referring to specific information from documents
+2. Only cite information that appears in the provided documents
+3. Don't use citations for general knowledge
+4. Include a "REFERENCES" section at the end listing all sources cited:
+   [number] -> Document: [filename], Chunk: [chunk_number]
+   Include page number if available: [number] -> Document: [filename], Page: [page], Chunk: [chunk_number]
+
+If the documents don't contain information about the question:
+1. State clearly "The provided documents don't contain information about this topic"
+2. You may provide a brief general answer without citations
+"""
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
@@ -366,7 +380,7 @@ def analyze_with_gemini(text: str, question: str = "What is this about?"):
         analysis_text = text
         
     model = genai.GenerativeModel("gemini-2.0-flash", generation_config={"temperature": 0.2})
-    prompt = f"""Here is the content, include the citation of the source in the answer [page number, line number]:
+    prompt = f"""Here is the content, include the citation of the source in the answer [source filename]:
 
 {analysis_text}
 
@@ -378,31 +392,42 @@ Now, answer:
     return response.text.strip()
 
 # ---------------------
-# Process Document with Session Management
+# Process Documents with Session Management
 # ---------------------
-def process_document(file_path: str, session_id: str, initial_question: str = "What is this about?"):
-    """Process a document and return session details"""
-    # Read file content
+def process_documents(file_paths: list, session_id: str, initial_question: str = "What is this about?"):
+    """Process one or more documents and return session details"""
     start_time = time.time()
-    print(f"📖 Reading content from {file_path}...")
-    content = read_file_content(file_path)
     
-    if not content:
-        raise ValueError(f"Failed to extract content from {file_path}")
+    # Load documents
+    print(f"📖 Loading content from {len(file_paths)} file(s)...")
+    documents = load_multiple_documents(file_paths)
+    
+    if not documents:
+        raise ValueError(f"Failed to extract content from any of the provided files")
+    
+    # Create combined content preview
+    combined_content = "\n".join([doc.page_content[:500] for doc in documents[:3]])
+    if len(documents) > 3:
+        combined_content += f"\n\n... and {len(documents) - 3} more document(s) ..."
+    combined_content = combined_content[:1000] + ("..." if len(combined_content) > 1000 else "")
+    
+    # Calculate total content length
+    total_content_length = sum(len(doc.page_content) for doc in documents)
     
     # Process content
     print(f"🔍 Creating vector database for session {session_id}...")
-    if len(content) > 500000:  # ~500KB
-        print("📚 Large file detected. Using optimized processing...")
-        db = process_large_file(file_path, session_id)
-    else:
-        db = create_vector_db(content, session_id)
+    db = create_vector_db(documents, session_id)
     
     # Create QA chain
     qa_chain = create_qa_chain(db)
     
     # Generate initial summary
-    summary = analyze_with_gemini(content, initial_question)
+    # For summary, use content from first document if multiple files
+    sample_text = documents[0].page_content
+    if total_content_length > 100000:
+        # If content is very large, limit sample text
+        sample_text = sample_text[:100000]
+    summary = analyze_with_gemini(sample_text, initial_question)
     
     # Answer initial question
     initial_answer = qa_chain.invoke({"input": initial_question}).get("answer", "No answer found")
@@ -410,12 +435,16 @@ def process_document(file_path: str, session_id: str, initial_question: str = "W
     # Calculate processing time
     processing_time = time.time() - start_time
     
+    # Get list of file names
+    file_names = list(set(doc.metadata.get('source_file', 'unknown') for doc in documents))
+    
     # Store QA chain in active sessions
     active_sessions[session_id] = {
         "qa_chain": qa_chain,
-        "content_preview": content[:1000] + ("..." if len(content) > 1000 else ""),
-        "content_length": len(content),
-        "file_path": file_path,
+        "content_preview": combined_content,
+        "content_length": total_content_length,
+        "file_paths": file_paths,
+        "file_names": file_names,
         "created_at": time.time(),
         "last_accessed": time.time()
     }
@@ -423,9 +452,10 @@ def process_document(file_path: str, session_id: str, initial_question: str = "W
     # Return results
     return {
         "session_id": session_id,
-        "file_name": os.path.basename(file_path),
-        "content_length": len(content),
-        "content_preview": content[:500] + ("..." if len(content) > 500 else ""),
+        "file_names": file_names,
+        "num_files": len(file_paths),
+        "content_length": total_content_length,
+        "content_preview": combined_content,
         "summary": summary,
         "initial_answer": initial_answer,
         "processing_time": round(processing_time, 2)
@@ -448,59 +478,72 @@ def health_check():
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
-    """Upload a file for processing"""
-    print('uploading ')
-    # Check if file is present in request
-    if 'file' not in request.files and 'url' not in request.form:
+    """Upload one or more files for processing"""
+    print('Uploading files...')
+    
+    # Check if file(s) or URL are present in request
+    has_files = 'file' in request.files
+    has_multiple_files = request.files.getlist('file') and len(request.files.getlist('file')) > 1
+    has_url = 'url' in request.form
+    
+    if not has_files and not has_url:
         return jsonify({"error": "No file or URL provided"}), 400
     
     # Generate a session ID
     session_id = str(uuid.uuid4())
+    file_paths = []
     
     try:
-        # Process file upload or URL
-        if 'file' in request.files:
-            file = request.files['file']
+        # Process file uploads
+        if has_files:
+            files = request.files.getlist('file')  # Get multiple files
             
-            # Check if valid file
-            if file.filename == '':
-                return jsonify({"error": "No file selected"}), 400
+            for file in files:
+                # Check if valid file
+                if file.filename == '':
+                    continue
+                    
+                if not allowed_file(file.filename):
+                    return jsonify({"error": f"File type not allowed for {file.filename}. Supported types: {', '.join(ALLOWED_EXTENSIONS)}"}), 400
                 
-            if not allowed_file(file.filename):
-                return jsonify({"error": f"File type not allowed. Supported types: {', '.join(ALLOWED_EXTENSIONS)}"}), 400
-            
-            # Save the file
-            filename = secure_filename(file.filename)
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_{filename}")
-            file.save(file_path)
-            
-        elif 'url' in request.form:
+                # Save the file
+                filename = secure_filename(file.filename)
+                file_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_{filename}")
+                file.save(file_path)
+                file_paths.append(file_path)
+                
+        # Process URL
+        if has_url:
             url = request.form['url'].strip()
             
             # Handle YouTube URLs
             if "youtube.com" in url or "youtu.be" in url:
                 file_path = download_audio_from_youtube(url)
+                file_paths.append(file_path)
             else:
                 return jsonify({"error": "Only YouTube URLs are supported"}), 400
+        
+        if not file_paths:
+            return jsonify({"error": "No valid files provided"}), 400
         
         # Get initial question if provided
         initial_question = request.form.get('question', "What is this about?")
         
-        # Process document in a background thread to avoid blocking
+        # Process documents in a background thread to avoid blocking
         def process_in_background():
             try:
-                result = process_document(file_path, session_id, initial_question)
+                result = process_documents(file_paths, session_id, initial_question)
                 # Store result for later retrieval
                 active_sessions[session_id]["processing_result"] = result
                 active_sessions[session_id]["processing_complete"] = True
             except Exception as e:
-                print(f"Error processing document: {str(e)}")
+                print(f"Error processing documents: {str(e)}")
                 active_sessions[session_id]["processing_error"] = str(e)
                 active_sessions[session_id]["processing_complete"] = True
         
         # Initialize session entry
         active_sessions[session_id] = {
-            "file_path": file_path,
+            "file_paths": file_paths,
             "created_at": time.time(),
             "processing_complete": False
         }
@@ -512,7 +555,7 @@ def upload_file():
         return jsonify({
             "session_id": session_id,
             "status": "processing",
-            "message": "File uploaded and processing started"
+            "message": f"{'Files' if has_multiple_files else 'File'} uploaded and processing started"
         })
         
     except Exception as e:
@@ -544,7 +587,8 @@ def session_status(session_id):
     if session.get("processing_complete", False) and "processing_error" not in session:
         result = session.get("processing_result", {})
         status_info.update({
-            "file_name": os.path.basename(session.get("file_path", "")),
+            "file_names": session.get("file_names", []),
+            "num_files": len(session.get("file_paths", [])),
             "content_length": result.get("content_length", 0),
             "processing_time": result.get("processing_time", 0)
         })
@@ -657,12 +701,13 @@ def delete_session(session_id):
     
     try:
         # Get file path from session
-        file_path = active_sessions[session_id].get("file_path")
+        file_paths = active_sessions[session_id].get("file_paths", [])
         
-        # Delete the file if it exists
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-            
+        # Delete the files if they exist
+        for file_path in file_paths:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        
         # Delete vector database directory
         session_dir = os.path.join(SESSION_FOLDER, session_id)
         if os.path.exists(session_dir):
@@ -687,7 +732,8 @@ def list_sessions():
     for session_id, session_data in active_sessions.items():
         sessions.append({
             "session_id": session_id,
-            "file_name": os.path.basename(session_data.get("file_path", "")),
+            "file_names": session_data.get("file_names", []),
+            "num_files": len(session_data.get("file_paths", [])),
             "created_at": session_data.get("created_at"),
             "last_accessed": session_data.get("last_accessed"),
             "processing_complete": session_data.get("processing_complete", False),
@@ -710,12 +756,13 @@ def cleanup_old_sessions():
     for session_id in sessions_to_remove:
         try:
             # Get file path from session
-            file_path = active_sessions[session_id].get("file_path")
+            file_paths = active_sessions[session_id].get("file_paths", [])
             
-            # Delete the file if it exists
-            if file_path and os.path.exists(file_path):
-                os.remove(file_path)
-                
+            # Delete the files if they exist
+            for file_path in file_paths:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            
             # Delete vector database directory
             session_dir = os.path.join(SESSION_FOLDER, session_id)
             if os.path.exists(session_dir):
