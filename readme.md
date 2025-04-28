@@ -295,13 +295,6 @@ any-file-rag/
 └── .env                # Environment variables
 ```
 
-### Testing
-
-Run the test suite with:
-```
-python -m pytest tests/
-```
-
 ### Local Development
 
 For development purposes, you can run the server with debug mode enabled:
