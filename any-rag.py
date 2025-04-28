@@ -108,25 +108,57 @@ def load_single_document(file_path: str) -> list:
     file_ext = os.path.splitext(file_path)[1].lower()
     file_name = os.path.basename(file_path)
     
+    print(f"Processing file: {file_name} with extension {file_ext}")
+    
     # Handle audio/video files with transcription
     if file_ext in ['.mp3', '.mp4']:
-        transcription = transcribe_audio(file_path)
-        doc = Document(page_content=transcription, metadata={'source_file': file_name})
-        return [doc]
+        try:
+            transcription = transcribe_audio(file_path)
+            doc = Document(page_content=transcription, metadata={'source_file': file_name})
+            return [doc]
+        except Exception as e:
+            print(f"Error processing audio/video file {file_path}: {str(e)}")
+            raise
     
-    # Handle YouTube URLs
+    # Handle YouTube URLs (though this case should not normally reach here)
     elif "youtube.com" in file_path or "youtu.be" in file_path:
-        audio_path = download_audio_from_youtube(file_path)
-        transcription = transcribe_audio(audio_path)
-        doc = Document(page_content=transcription, metadata={'source_file': os.path.basename(audio_path)})
-        return [doc]
+        try:
+            audio_path = download_audio_from_youtube(file_path)
+            transcription = transcribe_audio(audio_path)
+            doc = Document(page_content=transcription, metadata={'source_file': os.path.basename(audio_path)})
+            return [doc]
+        except Exception as e:
+            print(f"Error processing YouTube URL {file_path}: {str(e)}")
+            raise
     
     # Handle regular files
     loader_mapping = get_loader_mapping()
     try:
-        if file_ext in loader_mapping and loader_mapping[file_ext]:
+        # Handle PDF files with a special case since it's most reliable
+        if file_ext == '.pdf':
+            print(f"Loading PDF file: {file_path}")
+            loader = PyPDFLoader(file_path)
+            documents = loader.load()
+        elif file_ext == '.txt':
+            print(f"Loading TXT file: {file_path}")
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                text_content = f.read()
+            doc = Document(page_content=text_content, metadata={'source_file': file_name})
+            documents = [doc]
+        elif file_ext in ['.docx', '.doc']:
+            print(f"Loading Word document: {file_path}")
+            try:
+                doc = DocxDocument(file_path)
+                text = "\n".join([para.text for para in doc.paragraphs if para.text])
+                documents = [Document(page_content=text, metadata={'source_file': file_name})]
+            except Exception as doc_e:
+                print(f"Error with standard docx loader, trying UnstructuredWordDocumentLoader: {str(doc_e)}")
+                # Fallback to UnstructuredWordDocumentLoader
+                loader = UnstructuredWordDocumentLoader(file_path)
+                documents = loader.load()
+        elif file_ext in loader_mapping and loader_mapping[file_ext]:
             loader_class = loader_mapping[file_ext]
-            print(f"Loading {file_ext} file: {file_path}")
+            print(f"Loading {file_ext} file with {loader_class.__name__}: {file_path}")
             loader = loader_class(file_path)
             documents = loader.load()
         else:
@@ -134,6 +166,14 @@ def load_single_document(file_path: str) -> list:
             print(f"Attempting to load with default loader: {file_path}")
             loader = loader_mapping["default"](file_path)
             documents = loader.load()
+        
+        if not documents:
+            print(f"Warning: No content extracted from {file_path}")
+            # Create a minimal document with an error message
+            documents = [Document(
+                page_content=f"Error: No content could be extracted from this file: {file_name}",
+                metadata={'source_file': file_name, 'error': 'No content extracted'}
+            )]
         
         # Add source filename to metadata
         for doc in documents:
@@ -148,7 +188,12 @@ def load_single_document(file_path: str) -> list:
         return documents
     except Exception as e:
         print(f"Error loading {file_path}: {str(e)}")
-        return []
+        # Instead of returning empty list, create a document with error information
+        error_doc = Document(
+            page_content=f"Error loading file: {file_name}\nError details: {str(e)}",
+            metadata={'source_file': file_name, 'error': str(e)}
+        )
+        return [error_doc]
 
 def load_multiple_documents(file_paths: list) -> list:
     """Load multiple documents from a list of file paths"""
@@ -200,17 +245,46 @@ def make_embedder(lightweight=False):
 # YouTube + Audio Handling 
 # ---------------------
 def download_audio_from_youtube(url: str, output_path: str = None):
-    if output_path is None:
-        output_path = os.path.join(UPLOAD_FOLDER, f"youtube_{uuid.uuid4()}.mp3")
-    
-    subprocess.run(["yt-dlp", "-x", "--audio-format", "mp3", "-o", output_path, url], check=True)
-    print(f"✅ Downloaded audio to {output_path}")
-    return output_path
+    try:
+        # Create unique filename for the YouTube download
+        if output_path is None:
+            unique_id = str(uuid.uuid4())[:8]
+            output_path = os.path.join(UPLOAD_FOLDER, f"youtube_{unique_id}.mp3")
+        
+        # Ensure yt-dlp is present (pip install yt-dlp)
+        try:
+            # Run yt-dlp with specific template to avoid filename issues
+            cmd = [
+                "yt-dlp", 
+                "-x", 
+                "--audio-format", "mp3", 
+                "--audio-quality", "0",
+                "-o", output_path,
+                url
+            ]
+            print(f"Executing command: {' '.join(cmd)}")
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            print(f"✅ Downloaded audio to {output_path}")
+            return output_path
+        except subprocess.CalledProcessError as e:
+            print(f"Error downloading YouTube video: {e}")
+            print(f"Command output: {e.stdout}")
+            print(f"Command error: {e.stderr}")
+            raise ValueError(f"Failed to download YouTube video. Error: {str(e)}")
+        except FileNotFoundError:
+            raise ValueError("yt-dlp not installed. Please install with 'pip install yt-dlp'")
+    except Exception as e:
+        print(f"YouTube download failed: {str(e)}")
+        raise
 
 def transcribe_audio(file_path: str):
-    transcript = aai.Transcriber().transcribe(file_path)
-    print("✅ Transcription complete.")
-    return transcript.text
+    try:
+        transcript = aai.Transcriber().transcribe(file_path)
+        print("✅ Transcription complete.")
+        return transcript.text
+    except Exception as e:
+        print(f"Error during transcription: {str(e)}")
+        raise ValueError(f"Failed to transcribe audio: {str(e)}")
 
 # ---------------------
 # Optimized Vector DB Creation
@@ -397,10 +471,23 @@ def process_documents(file_paths: list, session_id: str, initial_question: str =
     
     # Load documents
     print(f"📖 Loading content from {len(file_paths)} file(s)...")
-    documents = load_multiple_documents(file_paths)
+    documents = []
+    error_messages = []
+    
+    # Try to load each document, collect any errors
+    for path in file_paths:
+        try:
+            docs = load_single_document(path)
+            if docs:
+                documents.extend(docs)
+            else:
+                error_messages.append(f"No content extracted from {os.path.basename(path)}")
+        except Exception as e:
+            error_messages.append(f"Error loading {os.path.basename(path)}: {str(e)}")
     
     if not documents:
-        raise ValueError(f"Failed to extract content from any of the provided files")
+        error_detail = "; ".join(error_messages)
+        raise ValueError(f"Failed to extract content from any of the provided files. Details: {error_detail}")
     
     # Create combined content preview
     combined_content = "\n".join([doc.page_content[:500] for doc in documents[:3]])
@@ -481,10 +568,33 @@ def upload_file():
     # Check if file(s) or URL are present in request
     has_files = 'file' in request.files
     has_multiple_files = request.files.getlist('file') and len(request.files.getlist('file')) > 1
-    has_url = 'url' in request.form
+    print(f"Files found: {len(request.files.getlist('file'))}")
     
-    if not has_files and not has_url:
-        return jsonify({"error": "No file or URL provided"}), 400
+    # Check for YouTube URL in form data or JSON payload
+    youtube_url = ''
+    if request.form and 'youtube_url' in request.form:
+        youtube_url = request.form['youtube_url']
+        print(f"Found YouTube URL in form data: {youtube_url}")
+    elif request.is_json and request.json and 'youtube_url' in request.json:
+        youtube_url = request.json['youtube_url']
+        print(f"Found YouTube URL in JSON payload: {youtube_url}")
+    elif request.data:
+        try:
+            json_data = json.loads(request.data)
+            if 'youtube_url' in json_data:
+                youtube_url = json_data['youtube_url']
+                print(f"Found YouTube URL in raw request data: {youtube_url}")
+        except:
+            pass
+            
+    has_youtube_url = bool(youtube_url)
+    print(f"YouTube URL found: {has_youtube_url}")
+    
+    if not has_files and not has_youtube_url:
+        print("Neither files nor YouTube URL found in request")
+        print(f"Form data keys: {list(request.form.keys()) if request.form else 'None'}")
+        print(f"JSON data: {request.json if request.is_json else 'None'}")
+        return jsonify({"error": "No file or YouTube URL provided"}), 400
     
     # Generate a session ID
     session_id = str(uuid.uuid4())
@@ -508,23 +618,49 @@ def upload_file():
                 file_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_{filename}")
                 file.save(file_path)
                 file_paths.append(file_path)
+                print(f"Saved file: {file_path}")
                 
-        # Process URL
-        if has_url:
-            url = request.form['url'].strip()
+        # Process YouTube URL
+        if has_youtube_url:
+            print(f"Processing YouTube URL: {youtube_url}")
             
             # Handle YouTube URLs
-            if "youtube.com" in url or "youtu.be" in url:
-                file_path = download_audio_from_youtube(url)
-                file_paths.append(file_path)
+            if "youtube.com" in youtube_url or "youtu.be" in youtube_url:
+                try:
+                    file_path = download_audio_from_youtube(youtube_url)
+                    file_paths.append(file_path)
+                    print(f"YouTube processing complete: {file_path}")
+                except Exception as e:
+                    return jsonify({"error": f"YouTube processing failed: {str(e)}"}), 500
             else:
                 return jsonify({"error": "Only YouTube URLs are supported"}), 400
         
         if not file_paths:
             return jsonify({"error": "No valid files provided"}), 400
         
-        # Get initial question if provided
-        initial_question = request.form.get('question', "What is this about?")
+        # Get initial question if provided - check multiple sources
+        initial_question = None
+        
+        # Try to get from form data first
+        if request.form and 'question' in request.form:
+            initial_question = request.form.get('question')
+        # Then try from JSON if available
+        elif request.is_json and request.json and 'question' in request.json:
+            initial_question = request.json.get('question')
+        # Finally try from raw data as JSON
+        elif request.data:
+            try:
+                json_data = json.loads(request.data)
+                if 'question' in json_data:
+                    initial_question = json_data['question']
+            except:
+                pass
+        
+        # Default if not found
+        if not initial_question:
+            initial_question = "What is this about?"
+            
+        print(f"Using initial question: {initial_question}")
         
         # Process documents in a background thread to avoid blocking
         def process_in_background():
@@ -556,6 +692,7 @@ def upload_file():
         })
         
     except Exception as e:
+        print(f"Upload error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/sessions/<session_id>/status', methods=['GET'])
