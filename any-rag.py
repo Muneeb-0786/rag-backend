@@ -1,0 +1,744 @@
+import os
+import subprocess
+import mimetypes
+import gc
+import time
+import threading
+import queue
+import json
+import tempfile
+import uuid
+import numpy as np
+import assemblyai as aai
+import google.generativeai as genai
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from langchain.docstore.document import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from langchain_google_genai import GoogleGenerativeAI
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+from dotenv import load_dotenv
+from PyPDF2 import PdfReader
+from docx import Document as DocxDocument
+
+# Flask imports
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+
+# Load environment variables
+load_dotenv()
+
+# API keys
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not ASSEMBLYAI_API_KEY or not GEMINI_API_KEY:
+    raise ValueError("Missing API key(s) in environment variables.")
+
+# Initialize AssemblyAI and Gemini
+aai.settings.api_key = ASSEMBLYAI_API_KEY
+genai.configure(api_key=GEMINI_API_KEY)
+
+# ---------------------
+# Performance Config
+# ---------------------
+MAX_WORKERS = 4  # Number of threads for parallel processing
+BATCH_SIZE = 100  # Batch size for embeddings
+EMBEDDER_CACHE_SIZE = 1024  # Size of embedding cache
+
+# ---------------------
+# Flask App Setup
+# ---------------------
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
+
+# Configure file upload settings
+UPLOAD_FOLDER = os.path.join(os.getcwd(), 'uploads')
+ALLOWED_EXTENSIONS = {'pdf', 'txt', 'docx', 'mp3', 'mp4'}
+MAX_CONTENT_LENGTH = 100 * 1024 * 1024  # 100MB limit
+
+# Create uploads directory if it doesn't exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Configure session storage
+SESSION_FOLDER = os.path.join(os.getcwd(), 'sessions')
+os.makedirs(SESSION_FOLDER, exist_ok=True)
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+
+# Session storage for RAG instances
+active_sessions = {}
+
+# ---------------------
+# Embedding Helper with Caching
+# ---------------------
+@lru_cache(maxsize=1)
+def get_embedder(lightweight=False, device="cpu"):
+    """Create and cache embedders to prevent reloading models"""
+    if lightweight:
+        # Use a smaller, more efficient model for very large files
+        return HuggingFaceEmbeddings(
+            model_name="sentence-transformers/paraphrase-MiniLM-L3-v2",
+            model_kwargs={"device": device},
+            encode_kwargs={"normalize_embeddings": False}
+        )
+    else:
+        return HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-mpnet-base-v2",
+            model_kwargs={"device": device},
+            encode_kwargs={"normalize_embeddings": False}
+        )
+
+def make_embedder(lightweight=False):
+    """Get cached embedder instance"""
+    # Check if GPU is available
+    device = "cuda" if os.environ.get("USE_GPU", "0") == "1" else "cpu"
+    return get_embedder(lightweight, device)
+
+# ---------------------
+# Optimized File Reader
+# ---------------------
+@lru_cache(maxsize=8)
+def read_file_content(file_path: str) -> str:
+    """Cache file reading results to avoid re-reading"""
+    mime_type, _ = mimetypes.guess_type(file_path)
+
+    if file_path.endswith(".pdf"):
+        try:
+            # Use optimized PDF reading
+            return read_pdf_optimized(file_path)
+        except Exception as e:
+            print(f"Error with optimized PDF reader: {e}. Falling back to standard.")
+            with open(file_path, "rb") as f:
+                reader = PdfReader(f)
+                return "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
+
+    elif file_path.endswith(".docx"):
+        doc = DocxDocument(file_path)
+        return "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+
+    elif file_path.endswith(".txt"):
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+    elif file_path.endswith(".mp3") or file_path.endswith(".mp4"):
+        return transcribe_audio(file_path)
+
+    elif "youtube.com" in file_path or "youtu.be" in file_path:
+        audio_path = download_audio_from_youtube(file_path)
+        return transcribe_audio(audio_path)
+
+    else:
+        raise ValueError(f"Unsupported file type: {file_path}")
+
+def read_pdf_optimized(file_path: str) -> str:
+    """More efficient PDF reading using parallel processing for multi-page PDFs"""
+    with open(file_path, "rb") as f:
+        reader = PdfReader(f)
+        if len(reader.pages) <= 5:  # For small PDFs, don't parallelize
+            return "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
+        
+        # For larger PDFs, use parallel processing
+        def extract_page_text(page_num):
+            try:
+                text = reader.pages[page_num].extract_text()
+                return text if text else ""
+            except Exception:
+                return ""
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            texts = list(executor.map(extract_page_text, range(len(reader.pages))))
+        
+        return "\n".join(text for text in texts if text)
+
+# ---------------------
+# YouTube + Audio Handling 
+# ---------------------
+def download_audio_from_youtube(url: str, output_path: str = None):
+    if output_path is None:
+        output_path = os.path.join(UPLOAD_FOLDER, f"youtube_{uuid.uuid4()}.mp3")
+    
+    subprocess.run(["yt-dlp", "-x", "--audio-format", "mp3", "-o", output_path, url], check=True)
+    print(f"✅ Downloaded audio to {output_path}")
+    return output_path
+
+def transcribe_audio(file_path: str):
+    transcript = aai.Transcriber().transcribe(file_path)
+    print("✅ Transcription complete.")
+    return transcript.text
+
+# ---------------------
+# Optimized Vector DB Creation
+# ---------------------
+def create_vector_db(text: str, session_id: str, batch_size=BATCH_SIZE):
+    """Create vector database with optimized splitting and parallel embedding"""
+    # Adjust chunk size based on text length for better retrieval
+    if len(text) > 1000000:  # For very large texts
+        chunk_size = 1500
+        chunk_overlap = 150
+    else:
+        chunk_size = 500
+        chunk_overlap = 50
+    
+    # Create documents
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    documents = splitter.split_documents([Document(page_content=text)])
+    print(f"✅ Split into {len(documents)} chunks.")
+    
+    # Use lightweight embedder for very large documents
+    use_lightweight = len(documents) > 500
+    embedder = make_embedder(lightweight=use_lightweight)
+    
+    # Process in parallel batches for large document sets
+    if len(documents) > 200:
+        db = create_vector_db_parallel(documents, embedder, batch_size)
+    else:
+        db = FAISS.from_documents(documents, embedder)
+    
+    # Save the database to the session folder
+    os.makedirs(os.path.join(SESSION_FOLDER, session_id), exist_ok=True)
+    db.save_local(os.path.join(SESSION_FOLDER, session_id, "faiss_index"))
+    print(f"✅ FAISS vector DB created for session {session_id}.")
+    return db
+
+def create_vector_db_parallel(documents, embedder, batch_size=BATCH_SIZE):
+    """Process embeddings in parallel batches for better performance"""
+    print(f"🔄 Processing embeddings in parallel batches of {batch_size}")
+    
+    # Split into manageable batches
+    total_batches = (len(documents) - 1) // batch_size + 1
+    batches = [documents[i:min(i+batch_size, len(documents))] 
+               for i in range(0, len(documents), batch_size)]
+    
+    # Create queue for results
+    db_queue = queue.Queue()
+    
+    # Process first batch separately to initialize the DB
+    print(f"  ⏳ Processing batch 1/{total_batches}")
+    db = FAISS.from_documents(batches[0], embedder)
+    
+    if total_batches > 1:
+        # Process remaining batches with a thread pool
+        def process_batch(batch_idx):
+            batch = batches[batch_idx]
+            print(f"  ⏳ Processing batch {batch_idx+1}/{total_batches} ({len(batch)} chunks)")
+            try:
+                temp_db = FAISS.from_documents(batch, embedder)
+                db_queue.put((batch_idx, temp_db))
+            except Exception as e:
+                print(f"Error processing batch {batch_idx+1}: {e}")
+                db_queue.put((batch_idx, None))
+        
+        # Use a thread pool with limited workers to avoid memory exhaustion
+        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, total_batches-1)) as executor:
+            # Submit all batches after the first one
+            futures = [executor.submit(process_batch, i) for i in range(1, total_batches)]
+        
+        # Process results in order
+        while not db_queue.empty():
+            _, temp_db = db_queue.get()
+            if temp_db:
+                db.merge_from(temp_db)
+            # Force cleanup after each merge
+            gc.collect()
+    
+    return db
+
+def load_vector_db(session_id: str):
+    """Load existing vector database from disk for a session"""
+    session_path = os.path.join(SESSION_FOLDER, session_id, "faiss_index")
+    if os.path.exists(session_path):
+        embedder = make_embedder()
+        return FAISS.load_local(session_path, embedder, allow_dangerous_deserialization=True)
+    return None
+
+# ---------------------
+# Process Large Files with Chunking
+# ---------------------
+def process_large_file(file_path: str, session_id: str, max_segment_size=500000):
+    """Process very large files by segmenting and processing in parallel"""
+    content = read_file_content(file_path)
+    
+    if len(content) <= max_segment_size:
+        # If content is not that large, process normally
+        return create_vector_db(content, session_id)
+    
+    # Create segments
+    segments = [content[i:i+max_segment_size] 
+                for i in range(0, len(content), max_segment_size)]
+    print(f"📚 Large file detected. Split into {len(segments)} segments")
+    
+    # Create empty database for merging
+    db = None
+    lightweight_embedder = make_embedder(lightweight=True)
+    
+    # Process segments with progress tracking
+    for i, segment in enumerate(segments):
+        print(f"🔄 Processing segment {i+1}/{len(segments)}")
+        
+        # Create vector database for this segment
+        segment_docs = RecursiveCharacterTextSplitter(
+            chunk_size=1500, chunk_overlap=150
+        ).split_documents([Document(page_content=segment)])
+        
+        # Process in batches
+        if db is None:
+            db = FAISS.from_documents(segment_docs, lightweight_embedder)
+        else:
+            segment_db = FAISS.from_documents(segment_docs, lightweight_embedder)
+            db.merge_from(segment_db)
+        
+        # Force cleanup
+        gc.collect()
+        time.sleep(0.5)  # Give system time to free memory
+    
+    # Save the database to the session folder
+    os.makedirs(os.path.join(SESSION_FOLDER, session_id), exist_ok=True)
+    db.save_local(os.path.join(SESSION_FOLDER, session_id, "faiss_index"))
+    return db
+
+# ---------------------
+# QA Chain (RAG)
+# ---------------------
+def create_qa_chain(db):
+    """Create RAG query chain"""
+    retriever = db.as_retriever(
+        search_type="mmr",  # Use Maximum Marginal Relevance for better diversity
+        search_kwargs={"k": 5, "fetch_k": 15, "lambda_mult": 0.7},
+    )
+    system_prompt =    """You are a helpful assistant answering questions about a document.
+        
+        INSTRUCTIONS:
+        1. FIRST, carefully examine the context below and use it to answer the question.
+        2. If the complete answer is found in the context, provide it in clear paragraphs.
+        3. If the context contains partial information:
+           a. Provide what you can from the context
+           b. THEN supplement with your general knowledge to complete the answer
+           c. Clearly mark which parts are from context vs. your knowledge with: [FROM CONTEXT] and [FROM MY KNOWLEDGE]
+        4. If the context doesn't contain ANY information related to the question:
+           a. Indicate this clearly: "The document doesn't address this question."
+           b. THEN provide a helpful answer using your knowledge that relates to the document's topic
+           c. Suggest specific search terms the user might try for more information
+        5. Always prioritize information from the context, but don't leave the user without a helpful answer.
+        6. Keep your answers focused on topics related to the document.
+        7. Include citations at the end of each paragraph in square brackets, not inline. For example: [page 5, lines 10-15]
+        8. Group related information into cohesive paragraphs with citations at the end rather than after each sentence.
+        
+        Context:
+        {context}
+        """
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "{input}")
+    ])
+
+    llm = GoogleGenerativeAI(
+        model="gemini-2.0-flash",
+        google_api_key=GEMINI_API_KEY,
+        temperature=0.3
+    )
+
+    doc_chain = create_stuff_documents_chain(llm=llm, prompt=prompt)
+    return create_retrieval_chain(retriever, doc_chain)
+
+# ---------------------
+# Optimized Gemini Analysis
+# ---------------------
+def analyze_with_gemini(text: str, question: str = "What is this about?"):
+    """Analyze text with Gemini"""
+    # For very large texts, use a more efficient summarization approach
+    if len(text) > 100000:
+        print("⚠️ Text too large, summarizing first part and sampling throughout")
+        # Take first 25K, middle 25K and last 25K for a more balanced view
+        first = text[:25000]
+        middle_start = max(0, len(text)//2 - 12500)
+        middle = text[middle_start:middle_start+25000]
+        last = text[-25000:] if len(text) > 25000 else ""
+        analysis_text = f"{first}\n\n[...middle content omitted...]\n\n{middle}\n\n[...additional content omitted...]\n\n{last}"
+    else:
+        analysis_text = text
+        
+    model = genai.GenerativeModel("gemini-2.0-flash", generation_config={"temperature": 0.2})
+    prompt = f"""Here is the content, include the citation of the source in the answer [page number, line number]:
+
+{analysis_text}
+
+Now, answer:
+{question}
+"""
+    response = model.generate_content(prompt)
+    print("✅ Gemini summary generated.")
+    return response.text.strip()
+
+# ---------------------
+# Process Document with Session Management
+# ---------------------
+def process_document(file_path: str, session_id: str, initial_question: str = "What is this about?"):
+    """Process a document and return session details"""
+    # Read file content
+    start_time = time.time()
+    print(f"📖 Reading content from {file_path}...")
+    content = read_file_content(file_path)
+    
+    if not content:
+        raise ValueError(f"Failed to extract content from {file_path}")
+    
+    # Process content
+    print(f"🔍 Creating vector database for session {session_id}...")
+    if len(content) > 500000:  # ~500KB
+        print("📚 Large file detected. Using optimized processing...")
+        db = process_large_file(file_path, session_id)
+    else:
+        db = create_vector_db(content, session_id)
+    
+    # Create QA chain
+    qa_chain = create_qa_chain(db)
+    
+    # Generate initial summary
+    summary = analyze_with_gemini(content, initial_question)
+    
+    # Answer initial question
+    initial_answer = qa_chain.invoke({"input": initial_question}).get("answer", "No answer found")
+    
+    # Calculate processing time
+    processing_time = time.time() - start_time
+    
+    # Store QA chain in active sessions
+    active_sessions[session_id] = {
+        "qa_chain": qa_chain,
+        "content_preview": content[:1000] + ("..." if len(content) > 1000 else ""),
+        "content_length": len(content),
+        "file_path": file_path,
+        "created_at": time.time(),
+        "last_accessed": time.time()
+    }
+    
+    # Return results
+    return {
+        "session_id": session_id,
+        "file_name": os.path.basename(file_path),
+        "content_length": len(content),
+        "content_preview": content[:500] + ("..." if len(content) > 500 else ""),
+        "summary": summary,
+        "initial_answer": initial_answer,
+        "processing_time": round(processing_time, 2)
+    }
+
+# ---------------------
+# Flask Routes
+# ---------------------
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """API health check endpoint"""
+    return jsonify({
+        "status": "ok",
+        "timestamp": time.time(),
+        "version": "1.0.0"
+    })
+
+@app.route('/api/upload', methods=['POST'])
+def upload_file():
+    """Upload a file for processing"""
+    print('uploading ')
+    # Check if file is present in request
+    if 'file' not in request.files and 'url' not in request.form:
+        return jsonify({"error": "No file or URL provided"}), 400
+    
+    # Generate a session ID
+    session_id = str(uuid.uuid4())
+    
+    try:
+        # Process file upload or URL
+        if 'file' in request.files:
+            file = request.files['file']
+            
+            # Check if valid file
+            if file.filename == '':
+                return jsonify({"error": "No file selected"}), 400
+                
+            if not allowed_file(file.filename):
+                return jsonify({"error": f"File type not allowed. Supported types: {', '.join(ALLOWED_EXTENSIONS)}"}), 400
+            
+            # Save the file
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_{filename}")
+            file.save(file_path)
+            
+        elif 'url' in request.form:
+            url = request.form['url'].strip()
+            
+            # Handle YouTube URLs
+            if "youtube.com" in url or "youtu.be" in url:
+                file_path = download_audio_from_youtube(url)
+            else:
+                return jsonify({"error": "Only YouTube URLs are supported"}), 400
+        
+        # Get initial question if provided
+        initial_question = request.form.get('question', "What is this about?")
+        
+        # Process document in a background thread to avoid blocking
+        def process_in_background():
+            try:
+                result = process_document(file_path, session_id, initial_question)
+                # Store result for later retrieval
+                active_sessions[session_id]["processing_result"] = result
+                active_sessions[session_id]["processing_complete"] = True
+            except Exception as e:
+                print(f"Error processing document: {str(e)}")
+                active_sessions[session_id]["processing_error"] = str(e)
+                active_sessions[session_id]["processing_complete"] = True
+        
+        # Initialize session entry
+        active_sessions[session_id] = {
+            "file_path": file_path,
+            "created_at": time.time(),
+            "processing_complete": False
+        }
+        
+        # Start processing in background
+        threading.Thread(target=process_in_background).start()
+        
+        # Return session ID immediately
+        return jsonify({
+            "session_id": session_id,
+            "status": "processing",
+            "message": "File uploaded and processing started"
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/sessions/<session_id>/status', methods=['GET'])
+def session_status(session_id):
+    """Check the status of a processing session"""
+    if session_id not in active_sessions:
+        return jsonify({"error": "Session not found"}), 404
+    
+    session = active_sessions[session_id]
+    
+    # Update last accessed time
+    session["last_accessed"] = time.time()
+    
+    # Return status
+    status_info = {
+        "session_id": session_id,
+        "processing_complete": session.get("processing_complete", False),
+        "created_at": session.get("created_at")
+    }
+    
+    # Add error if present
+    if "processing_error" in session:
+        status_info["error"] = session["processing_error"]
+    
+    # Add result summary if processing is complete
+    if session.get("processing_complete", False) and "processing_error" not in session:
+        result = session.get("processing_result", {})
+        status_info.update({
+            "file_name": os.path.basename(session.get("file_path", "")),
+            "content_length": result.get("content_length", 0),
+            "processing_time": result.get("processing_time", 0)
+        })
+    
+    return jsonify(status_info)
+
+@app.route('/api/sessions/<session_id>/result', methods=['GET'])
+def session_result(session_id):
+    """Get the complete processing result for a session"""
+    if session_id not in active_sessions:
+        return jsonify({"error": "Session not found"}), 404
+    
+    session = active_sessions[session_id]
+    
+    # Update last accessed time
+    session["last_accessed"] = time.time()
+    
+    # Check if processing is complete
+    if not session.get("processing_complete", False):
+        return jsonify({
+            "session_id": session_id,
+            "status": "processing",
+            "message": "Processing not yet complete"
+        }), 202
+    
+    # Check for errors
+    if "processing_error" in session:
+        return jsonify({
+            "session_id": session_id,
+            "status": "error",
+            "error": session["processing_error"]
+        }), 500
+    
+    # Return full result
+    return jsonify(session.get("processing_result", {}))
+
+@app.route('/api/sessions/<session_id>/query', methods=['POST'])
+def query_session(session_id):
+    """Query a processed document"""
+    if session_id not in active_sessions:
+        return jsonify({"error": "Session not found"}), 404
+    
+    session = active_sessions[session_id]
+    
+    # Update last accessed time
+    session["last_accessed"] = time.time()
+    
+    # Check if processing is complete
+    if not session.get("processing_complete", False):
+        return jsonify({
+            "status": "processing",
+            "message": "Document still processing"
+        }), 202
+    
+    # Check for errors
+    if "processing_error" in session:
+        return jsonify({
+            "status": "error",
+            "error": session["processing_error"]
+        }), 500
+    
+    # Get query from request
+    data = request.json
+    if not data or "query" not in data:
+        return jsonify({"error": "No query provided"}), 400
+    
+    query = data["query"]
+    detailed = data.get("detailed", False)
+    
+    try:
+        # Get QA chain
+        qa_chain = session.get("qa_chain")
+        if not qa_chain:
+            return jsonify({"error": "Session QA chain not found"}), 500
+        
+        # Execute query
+        start_time = time.time()
+        result = qa_chain.invoke({"input": query})
+        processing_time = time.time() - start_time
+        
+        # Prepare response
+        answer = result.get("answer", "No answer found")
+        response = {
+            "query": query,
+            "answer": answer,
+            "processing_time": round(processing_time, 2)
+        }
+        
+        # Add source documents if detailed requested
+        if detailed and "source_documents" in result:
+            sources = []
+            for i, doc in enumerate(result["source_documents"][:5]):  # Include top 5 sources
+                sources.append({
+                    "id": i + 1,
+                    "content": doc.page_content,
+                    "metadata": doc.metadata
+                })
+            response["sources"] = sources
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/sessions/<session_id>', methods=['DELETE'])
+def delete_session(session_id):
+    """Delete a session and its associated files"""
+    if session_id not in active_sessions:
+        return jsonify({"error": "Session not found"}), 404
+    
+    try:
+        # Get file path from session
+        file_path = active_sessions[session_id].get("file_path")
+        
+        # Delete the file if it exists
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+            
+        # Delete vector database directory
+        session_dir = os.path.join(SESSION_FOLDER, session_id)
+        if os.path.exists(session_dir):
+            import shutil
+            shutil.rmtree(session_dir)
+            
+        # Remove session from active sessions
+        del active_sessions[session_id]
+        
+        # Trigger garbage collection
+        gc.collect()
+        
+        return jsonify({"status": "success", "message": "Session deleted"})
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/sessions', methods=['GET'])
+def list_sessions():
+    """List all active sessions"""
+    sessions = []
+    for session_id, session_data in active_sessions.items():
+        sessions.append({
+            "session_id": session_id,
+            "file_name": os.path.basename(session_data.get("file_path", "")),
+            "created_at": session_data.get("created_at"),
+            "last_accessed": session_data.get("last_accessed"),
+            "processing_complete": session_data.get("processing_complete", False),
+            "has_error": "processing_error" in session_data
+        })
+    
+    return jsonify({"sessions": sessions})
+
+# Periodic cleanup of old sessions
+def cleanup_old_sessions():
+    """Remove sessions that haven't been accessed for a while"""
+    current_time = time.time()
+    session_timeout = 3600  # 1 hour
+    
+    sessions_to_remove = []
+    for session_id, session_data in active_sessions.items():
+        if current_time - session_data.get("last_accessed", current_time) > session_timeout:
+            sessions_to_remove.append(session_id)
+    
+    for session_id in sessions_to_remove:
+        try:
+            # Get file path from session
+            file_path = active_sessions[session_id].get("file_path")
+            
+            # Delete the file if it exists
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+                
+            # Delete vector database directory
+            session_dir = os.path.join(SESSION_FOLDER, session_id)
+            if os.path.exists(session_dir):
+                import shutil
+                shutil.rmtree(session_dir)
+                
+            # Remove session from active sessions
+            del active_sessions[session_id]
+            
+            print(f"Cleaned up session {session_id} due to inactivity")
+            
+        except Exception as e:
+            print(f"Error cleaning up session {session_id}: {str(e)}")
+    
+    # Schedule next cleanup
+    threading.Timer(600, cleanup_old_sessions).start()  # Run every 10 minutes
+
+# ---------------------
+# Main entry point
+# ---------------------
+if __name__ == "__main__":
+    print("🚀 Starting RAG API Server")
+    # Start cleanup thread
+    cleanup_old_sessions()
+    # Start the server
+    app.run(host='0.0.0.0', port=5000, debug=False)
