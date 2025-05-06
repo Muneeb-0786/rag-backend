@@ -1,320 +1,129 @@
-# Any File RAG 🚀
+# Any-File RAG System
 
-A versatile Retrieval Augmented Generation (RAG) system that can process, analyze, and answer questions about content from multiple file formats, including:
+A versatile Retrieval-Augmented Generation (RAG) system that works with any file format to create embeddings and enable semantic search and question answering.
 
-- 📄 PDF documents
-- 📝 Text files
-- 📋 Word documents (.docx)
-- 🎵 Audio files (.mp3)
-- 🎬 YouTube videos (via automatic transcription)
+## Overview
 
-## Features
+This project provides tools to:
+1. Create vector embeddings from various document formats (PDF, TXT, and others)
+2. Store these embeddings in vector databases (FAISS or Chroma)
+3. Query documents using natural language and get accurate, context-aware responses
 
-- **Multi-format Support**: Process various file types through a unified interface
-- **YouTube Integration**: Automatically download audio from YouTube videos and transcribe
-- **Audio Transcription**: Convert speech to text using AssemblyAI
-- **Efficient Processing**: Handles large files through chunking and batched processing
-- **Smart Memory Management**: Uses lightweight embeddings for very large documents
-- **Session Management**: Store and retrieve conversations with specific documents
-- **RESTful API**: Easy integration with any frontend application
+## Requirements
 
-## How It Works
+### Environment Variables
+The following environment variables must be set:
+- `COHERE_API_KEY`: Required for embeddings and LLM functionalities
+- `GEMINI_API_KEY`: Optional, used for query augmentation and visualization if available
 
-1. **Upload a file or YouTube URL**: The system processes the content and creates a vector database
-2. **Ask questions**: Submit questions about the document content
-3. **Get AI-powered answers**: The system uses Google's Gemini for:
-   - Direct summarization based on the entire content
-   - RAG-powered answers using relevant context retrieval
-
-## API Endpoints
-
-- `POST /api/upload`: Upload a file for processing
-- `POST /api/youtube`: Process a YouTube video
-- `POST /api/query`: Ask questions about previously processed content
-- `GET /api/sessions`: List active sessions
-
-## Setup
-
-### Prerequisites
-
+### Dependencies
 - Python 3.8+
-- AssemblyAI API key (for audio transcription)
-- Google Gemini API key (for AI generation)
+- langchain and related packages
+- Cohere API for embeddings and LLM
+- Optional: Google Generative AI (Gemini) for advanced features
+- Optional: sentence-transformers for cross-encoder reranking
 
-### Installation
+## Installation
 
-1. Clone the repository:
+1. Clone this repository
+2. Install required dependencies:
    ```
-   git clone https://github.com/yourusername/any-file-rag.git
-   cd any-file-rag
-   ```
-
-2. Create a virtual environment:
-   ```
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   pip install langchain langchain_community langchain_cohere faiss-cpu chromadb
+   pip install sentence-transformers  # Optional, for reranking
+   pip install google-generativeai  # Optional, for query augmentation
    ```
 
-3. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
+## Usage
 
-4. Create a `.env` file with your API keys:
-   ```
-   ASSEMBLYAI_API_KEY=your_assemblyai_api_key
-   GEMINI_API_KEY=your_gemini_api_key
-   ```
+### Creating Embeddings
 
-5. Run the application:
-   ```
-   python any-rag.py
-   ```
+Use `create_embeddings.py` to create vector embeddings from your documents:
 
-## Dependencies
+```bash
+# Process a single file
+python create_embeddings.py --file path/to/document.pdf
 
-- Flask: Web framework
-- LangChain: RAG pipeline infrastructure
-- FAISS: Vector database for efficient similarity search
-- AssemblyAI: Audio transcription API
-- Google Generative AI: Gemini models for text generation
-- yt-dlp: YouTube video download
-- PyPDF2: PDF parsing
-- python-docx: Word document parsing
-- sentence-transformers: Text embeddings
+# Process multiple files or directories
+python create_embeddings.py --files path/to/doc1.pdf path/to/doc2.txt path/to/folder
 
-## Usage Examples
+# Process files recursively from a directory
+python create_embeddings.py --files path/to/folder --recursive
 
-### Process a PDF document
+# Create a combined index from multiple files
+python create_embeddings.py --files path/to/folder --combine --combined-name my_index
 
-```python
-import requests
+# Customize chunk size and overlap
+python create_embeddings.py --files path/to/docs --chunk-size 1500 --chunk-overlap 200
 
-files = {'file': open('document.pdf', 'rb')}
-data = {'question': 'What are the key findings in this document?'}
-response = requests.post('http://localhost:5000/api/upload', files=files, data=data)
-print(response.json())
+# Use Chroma vector database instead of FAISS
+python create_embeddings.py --files path/to/docs --vector-db chroma
 ```
 
-### Process a YouTube video
+### Querying Documents
 
-```python
-import requests
-import json
+Use `query_embeddings.py` to ask questions about your documents:
 
-headers = {'Content-Type': 'application/json'}
-data = {
-    'url': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
-    'question': 'What is the main message of this video?'
-}
-response = requests.post('http://localhost:5000/api/youtube', headers=headers, data=json.dumps(data))
-print(response.json())
+```bash
+# Basic query against an index
+python query_embeddings.py --index indexed_docs/my_index
+
+# Specify retrieval method
+python query_embeddings.py --index indexed_docs/my_index --retrieval mmr
+
+# Adjust number of documents to retrieve
+python query_embeddings.py --index indexed_docs/my_index --k 6
+
+# Use reranking for better document selection
+python query_embeddings.py --index indexed_docs/my_index --use-reranking
+
+# Use query augmentation for improved retrieval
+python query_embeddings.py --index indexed_docs/my_index --use-augmentation
+
+# Use both reranking and query augmentation
+python query_embeddings.py --index indexed_docs/my_index --use-reranking --use-augmentation
 ```
 
-### Ask follow-up questions
+### Interactive Query Commands
 
-```python
-import requests
-import json
+When in the interactive query interface, you can use the following commands:
+- `exit` - Quit the application
+- `sources` - Show sources from the last question
+- `reset` - Reset chat history
 
-headers = {'Content-Type': 'application/json'}
-data = {
-    'session_id': '123e4567-e89b-12d3-a456-426614174000',  # Use session_id from previous response
-    'question': 'Can you elaborate on the second point?'
-}
-response = requests.post('http://localhost:5000/api/query', headers=headers, data=json.dumps(data))
-print(response.json())
+## Advanced Features
+
+### Vector Stores
+- FAISS (default): Efficient similarity search
+- Chroma: SQL-backed vector database with additional metadata capabilities
+
+### Retrieval Methods
+- Similarity search (default): Standard vector similarity retrieval
+- MMR (Maximum Marginal Relevance): Balances relevance with diversity
+- Similarity with score threshold: Only returns documents above a confidence threshold
+
+### Query Enhancement
+- Query augmentation: Generates alternative formulations of your question to improve retrieval
+- Cross-encoder reranking: Reranks initial results for better precision
+- Contextual compression: Extracts the most relevant parts of retrieved documents
+
+### Visualization
+When enabled (with Gemini API), the system generates visualizations of:
+- Query-document relationships in vector space
+- How augmented queries influence document retrieval
+- Which documents were selected as most relevant
+
+## Examples
+
+Create embeddings from a collection of PDF files and combine them into a single index:
+```bash
+python create_embeddings.py --files documents/*.pdf --combine --combined-name research_papers
 ```
 
-## Performance Considerations
-
-- The system uses batched processing for large documents to manage memory usage
-- For extremely large files (>1MB), the content is split into smaller segments
-- Memory usage is optimized through garbage collection between batches
-- Session data is ephemeral by default but vector databases are saved to disk
-
-## Demo
-
-![Any File RAG Demo](https://via.placeholder.com/800x400?text=Any+File+RAG+Demo)
-
-*Add a screenshot or GIF of your application in action. You can replace the placeholder URL above with an actual image link once available.*
-
-## API Reference
-
-### GET `/api/health`
-Health check endpoint to verify the API is running.
-
-**Response:**
-```json
-{
-  "status": "ok",
-  "timestamp": 1714168028.45,
-  "version": "1.0.0"
-}
+Query the documents with advanced retrieval:
+```bash
+python query_embeddings.py --index indexed_docs/research_papers --use-reranking --use-augmentation --k 8
 ```
-
-### POST `/api/upload`
-Upload a file for processing.
-
-**Request:**
-- Form data with:
-  - `file`: The file to process
-  - `question` (optional): Initial question to answer about the document
-
-**Response:**
-```json
-{
-  "session_id": "2ee25e17-9670-450c-b5c7-612aa20e9a7f",
-  "status": "processing",
-  "message": "File uploaded and processing started"
-}
-```
-
-### GET `/api/sessions/{session_id}/status`
-Check the status of a processing session.
-
-**Response:**
-```json
-{
-  "session_id": "2ee25e17-9670-450c-b5c7-612aa20e9a7f",
-  "processing_complete": true,
-  "created_at": 1714168028.45,
-  "file_name": "example.pdf",
-  "content_length": 125000,
-  "processing_time": 5.67
-}
-```
-
-### GET `/api/sessions/{session_id}/result`
-Get the complete processing result for a session.
-
-**Response:**
-```json
-{
-  "session_id": "2ee25e17-9670-450c-b5c7-612aa20e9a7f",
-  "file_name": "example.pdf",
-  "content_length": 125000,
-  "content_preview": "This is the beginning of the document...",
-  "summary": "This document discusses...",
-  "initial_answer": "The document is about...",
-  "processing_time": 5.67
-}
-```
-
-### POST `/api/sessions/{session_id}/query`
-Query a processed document.
-
-**Request:**
-```json
-{
-  "query": "What are the main points in this document?",
-  "detailed": true
-}
-```
-
-**Response:**
-```json
-{
-  "query": "What are the main points in this document?",
-  "answer": "The main points in the document are...",
-  "processing_time": 0.45,
-  "sources": [
-    {
-      "id": 1,
-      "content": "Relevant excerpt from the document...",
-      "metadata": {}
-    }
-  ]
-}
-```
-
-### DELETE `/api/sessions/{session_id}`
-Delete a session and its associated files.
-
-**Response:**
-```json
-{
-  "status": "success",
-  "message": "Session deleted"
-}
-```
-
-### GET `/api/sessions`
-List all active sessions.
-
-**Response:**
-```json
-{
-  "sessions": [
-    {
-      "session_id": "2ee25e17-9670-450c-b5c7-612aa20e9a7f",
-      "file_name": "example.pdf",
-      "created_at": 1714168028.45,
-      "last_accessed": 1714168120.78,
-      "processing_complete": true,
-      "has_error": false
-    }
-  ]
-}
-```
-
-## Troubleshooting
-
-### Common Issues
-
-1. **File Upload Errors**
-   - Check that your file is one of the supported formats: PDF, TXT, DOCX, MP3, MP4
-   - Ensure the file size is under the 100MB limit
-
-2. **API Key Issues**
-   - Verify that your AssemblyAI and Gemini API keys are correctly set in the `.env` file
-   - Check that your API keys are active and have sufficient credits
-
-3. **Memory Errors**
-   - When processing very large files, ensure your system has adequate RAM (8GB+ recommended)
-   - Try splitting extremely large documents into smaller parts
-
-4. **YouTube Processing Issues**
-   - Make sure you have yt-dlp properly installed
-   - Check that the YouTube URL is valid and the video is publicly accessible
-
-### Logging
-
-The application logs important events to the console. If you're experiencing issues, check the logs for error messages and stack traces.
-
-## Development
-
-### Project Structure
-
-```
-any-file-rag/
-├── any-rag.py          # Main application file
-├── requirements.txt    # Python dependencies
-├── uploads/            # Uploaded file storage
-├── sessions/           # Session vector databases
-└── .env                # Environment variables
-```
-
-### Local Development
-
-For development purposes, you can run the server with debug mode enabled:
-```
-python any-rag.py --debug
-```
-
-## Future Improvements
-
-- [ ] Add user authentication for secure API access
-- [ ] Implement Docker containerization for easy deployment
-- [ ] Add support for more file formats (e.g., Excel, PowerPoint)
-- [ ] Create a web-based UI for easier interaction
-- [ ] Implement caching to improve response times for repeated queries
-- [ ] Add support for real-time collaboration on documents
 
 ## License
 
-[MIT License](LICENSE)
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+[Add your licensing information here]
