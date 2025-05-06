@@ -1,4 +1,5 @@
 from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import Chroma
 from langchain.chains import ConversationalRetrievalChain
 from langchain_core.prompts import ChatPromptTemplate
 import os
@@ -94,6 +95,17 @@ def augment_query_generated(query, model="gemini-2.0-flash", num_variations=2):
         return [query]  # Return original query if there's an error
 
 
+def detect_vector_store_type(index_path: str) -> str:
+    """Detect whether the index is a FAISS or Chroma vector store."""
+    # If it's a directory with a chroma.sqlite3 file, it's likely Chroma
+    if os.path.isdir(index_path) and os.path.exists(os.path.join(index_path, "chroma.sqlite3")):
+        return "chroma"
+    # Otherwise, assume FAISS (which typically has a .faiss extension file)
+    return "faiss"
+
+# Add import for visualization
+from visualize_chunks import visualize_query_and_chunks
+
 def retrieve_and_rerank_documents(db, query, n_results=5, max_return=5, use_augmentation=True, model="cross-encoder/ms-marco-MiniLM-L-6-v2"):
     """Retrieve relevant documents for a given query using multiple query expansion and reranking"""
     if use_augmentation:
@@ -114,10 +126,37 @@ def retrieve_and_rerank_documents(db, query, n_results=5, max_return=5, use_augm
     # Get results for all queries
     results = []
     doc_objects = []
-    for q in queries:
-        docs = db.similarity_search(q, k=n_results)
-        doc_objects.extend(docs)
-        results.append([doc.page_content for doc in docs])
+    all_doc_objects = []
+    all_doc_contents = []
+    
+    # Store the embeddings for visualization
+    query_embedding = None
+    all_embeddings = []
+    
+    try:
+        # Get query embedding for the original query
+        if hasattr(db, 'embedding_function'):
+            query_embedding = db.embedding_function.embed_query(query)
+        else:
+            print("Warning: Vector store doesn't have an accessible embedding function for visualization")
+        
+        # Retrieve documents for each query
+        for q in queries:
+            docs = db.similarity_search(q, k=n_results)
+            doc_objects.extend(docs)
+            results.append([doc.page_content for doc in docs])
+            
+            # Collect all retrieved docs for visualization
+            all_docs = db.similarity_search(q, k=n_results*2)
+            for doc in all_docs:
+                if doc.page_content not in all_doc_contents:
+                    all_doc_objects.append(doc)
+                    all_doc_contents.append(doc.page_content)
+                    # Get embeddings for visualization if possible
+                    if hasattr(db, 'embedding_function'):
+                        all_embeddings.append(db.embedding_function.embed_query(doc.page_content))
+    except Exception as e:
+        print(f"Error during retrieval or embedding: {e}")
     
     # Deduplicate the retrieved documents
     unique_documents = []
@@ -156,7 +195,38 @@ def retrieve_and_rerank_documents(db, query, n_results=5, max_return=5, use_augm
 
             # Rerank the documents and limit to max_return
             reranked_doc_objects = [unique_doc_objects[i] for i in ranked_indices[:max_return]]
+            
+            # Get indices for the prominent chunks (for visualization)
+            prominent_indices = []
+            for doc in reranked_doc_objects:
+                try:
+                    idx = all_doc_objects.index(doc)
+                    prominent_indices.append(idx)
+                except ValueError:
+                    pass
+            
             print(f"\nReturning top {max_return} documents based on reranking.")
+            
+            # Visualize the query and chunks - only if we have embeddings
+            if query_embedding is not None and all_embeddings and len(all_embeddings) > 0:
+                try:
+                    visualization_result = visualize_query_and_chunks(
+                        query, 
+                        query_embedding, 
+                        all_doc_objects, 
+                        np.array(all_embeddings), 
+                        prominent_indices,
+                        use_gemini=True
+                    )
+                    
+                    if visualization_result:
+                        print(f"Visualization created successfully")
+                        if visualization_result.get("tsne_file"):
+                            print(f"TSNE visualization: {visualization_result['tsne_file']}")
+                        if visualization_result.get("gemini_file"):
+                            print(f"Gemini visualization: {visualization_result['gemini_file']}")
+                except Exception as e:
+                    print(f"Visualization error: {e}")
             
             return reranked_doc_objects
         except Exception as e:
@@ -165,8 +235,32 @@ def retrieve_and_rerank_documents(db, query, n_results=5, max_return=5, use_augm
             return unique_doc_objects[:max_return]
     else:
         print("\nCross-encoder not available. Skipping reranking.")
+        
+        # For visualization without reranking, just use the top chunks
+        prominent_indices = list(range(min(max_return, len(unique_doc_objects))))
+        
+        # Visualize the query and chunks - only if we have embeddings
+        if query_embedding is not None and all_embeddings and len(all_embeddings) > 0:
+            try:
+                visualization_result = visualize_query_and_chunks(
+                    query, 
+                    query_embedding, 
+                    all_doc_objects, 
+                    np.array(all_embeddings), 
+                    prominent_indices,
+                    use_gemini=True
+                )
+                
+                if visualization_result:
+                    print(f"Visualization created successfully")
+                    if visualization_result.get("tsne_file"):
+                        print(f"TSNE visualization: {visualization_result['tsne_file']}")
+                    if visualization_result.get("gemini_file"):
+                        print(f"Gemini visualization: {visualization_result['gemini_file']}")
+            except Exception as e:
+                print(f"Visualization error: {e}")
+            
         return unique_doc_objects[:max_return]
-
 
 def load_from_index(
     index_path: str, 
@@ -177,12 +271,26 @@ def load_from_index(
     lambda_mult: float = 0.5,
     use_compression: bool = False,
     use_reranking: bool = False,
-    use_augmentation: bool = False
+    use_augmentation: bool = False,
+    vector_store_type: str = None
 ):
     print(f"Loading index from: {index_path}")
     
+    # Auto-detect vector store type if not specified
+    if vector_store_type is None:
+        vector_store_type = detect_vector_store_type(index_path)
+    
+    print(f"Using vector store type: {vector_store_type}")
+    
     embeddings = CohereEmbeddings(model="embed-english-v3.0")
-    db = FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
+    
+    # Load the appropriate vector store
+    if vector_store_type.lower() == "faiss":
+        db = FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
+    elif vector_store_type.lower() == "chroma":
+        db = Chroma(persist_directory=index_path, embedding_function=embeddings)
+    else:
+        raise ValueError(f"Unsupported vector store type: {vector_store_type}")
     
     search_kwargs = {"k": k}
     if retrieval_type == "mmr":
@@ -252,7 +360,8 @@ class IndexChat:
         use_reranking: bool = False,
         use_augmentation: bool = False,
         n_results: int = 10,
-        max_return: int = 5
+        max_return: int = 5,
+        vector_store_type: str = None
     ):
         self.index_path = index_path
         self.retrieval_type = retrieval_type
@@ -266,6 +375,7 @@ class IndexChat:
         self.n_results = n_results
         self.max_return = max_return
         self.chat_history = []
+        self.vector_store_type = vector_store_type
         
         self.qa, self.db = load_from_index(
             index_path, 
@@ -276,7 +386,8 @@ class IndexChat:
             lambda_mult=lambda_mult,
             use_compression=use_compression,
             use_reranking=use_reranking,
-            use_augmentation=use_augmentation
+            use_augmentation=use_augmentation,
+            vector_store_type=vector_store_type
         )
     
     def ask(self, question: str) -> Tuple[str, str, List]:
@@ -310,16 +421,67 @@ class IndexChat:
                 print("Falling back to standard retrieval")
         
         # Standard retrieval path
-        result = self.qa({"question": question, "chat_history": self.chat_history})
-        answer = result["answer"]
-        generated_question = result.get("generated_question", question)
-        source_documents = result["source_documents"]
-        
-        self.chat_history.append((question, answer))
-        if len(self.chat_history) > 5:
-            self.chat_history = self.chat_history[-5:]
-        
-        return answer, generated_question, source_documents
+        try:
+            result = self.qa({"question": question, "chat_history": self.chat_history})
+            answer = result["answer"]
+            generated_question = result.get("generated_question", question)
+            source_documents = result["source_documents"]
+            
+            # Try to get query embedding for visualization
+            query_embedding = None
+            all_embeddings = []
+            all_docs = []
+            
+            try:
+                if hasattr(self.db, 'embedding_function'):
+                    # Get query embedding
+                    query_embedding = self.db.embedding_function.embed_query(question)
+                    
+                    # Get all documents for visualization (increase sample size)
+                    all_docs = self.db.similarity_search(question, k=30)  # Increased from 20
+                    
+                    # Get embeddings for all documents
+                    for doc in all_docs:
+                        all_embeddings.append(self.db.embedding_function.embed_query(doc.page_content))
+                    
+                    # Mark the prominent documents (those actually returned by the retriever)
+                    prominent_indices = []
+                    for doc in source_documents:
+                        for i, all_doc in enumerate(all_docs):
+                            if doc.page_content == all_doc.page_content:
+                                prominent_indices.append(i)
+                                break
+                    
+                    # Only visualize if we have embeddings
+                    if query_embedding is not None and len(all_embeddings) > 0:
+                        visualization_result = visualize_query_and_chunks(
+                            question, 
+                            query_embedding, 
+                            all_docs, 
+                            np.array(all_embeddings), 
+                            prominent_indices,
+                            use_gemini=True
+                        )
+                        
+                        if visualization_result:
+                            print(f"Visualization created successfully")
+                            if visualization_result.get("tsne_file"):
+                                print(f"TSNE visualization: {visualization_result['tsne_file']}")
+                            if visualization_result.get("gemini_file"):
+                                print(f"Gemini visualization: {visualization_result['gemini_file']}")
+                else:
+                    print("Visualization skipped - embedding function not available")
+            except Exception as e:
+                print(f"Visualization error (non-critical): {e}")
+            
+            self.chat_history.append((question, answer))
+            if len(self.chat_history) > 5:
+                self.chat_history = self.chat_history[-5:]
+            
+            return answer, generated_question, source_documents
+        except Exception as e:
+            print(f"Error in QA process: {e}")
+            return "I encountered an error processing your question. Please try again.", question, []
 
     def reset_chat(self):
         self.chat_history = []
@@ -331,14 +493,11 @@ def display_sources(source_docs, detailed: bool = False):
         return
     
     print("\n" + "="*50)
-    print("SOURCES:")
+    print("PROMINENT SOURCES:")
     print("="*50)
     for i, doc in enumerate(source_docs, 1):
         print(f"Source {i}:")
-        if detailed:
-            print(f"  Content: {doc.page_content}")
-        else:
-            print(f"  Content: {doc.page_content[:150]}...")
+        print(f"  Content: {doc.page_content}")
         print(f"  Metadata: {doc.metadata}")
         print("-"*40)
 
@@ -369,6 +528,8 @@ def main():
                         help='Number of initial results to retrieve for reranking')
     parser.add_argument('--max-return', type=int, default=5,
                         help='Maximum number of documents to return after reranking')
+    parser.add_argument('--vector-db', type=str, choices=['faiss', 'chroma'], 
+                       help='Vector database type to use (auto-detected if not specified)')
     
     args = parser.parse_args()
     
@@ -410,10 +571,12 @@ def main():
         use_reranking=args.use_reranking,
         use_augmentation=args.use_augmentation,
         n_results=args.n_results,
-        max_return=args.max_return
+        max_return=args.max_return,
+        vector_store_type=args.vector_db
     )
 
     print(f"\nLoaded index: {chat.index_path}")
+    print(f"Vector store type: {chat.vector_store_type}")
     print(f"Retrieval method: {chat.retrieval_type}, Chain type: {chat.chain_type}, k={chat.k}")
     if chat.retrieval_type == "mmr":
         print(f"MMR settings: fetch_k={chat.fetch_k}, lambda_mult={chat.lambda_mult}")
@@ -447,7 +610,7 @@ def main():
         
         print("\nAI:", answer)
         print("\nGenerated query:", db_query)
-        print(f"\n[Found {len(sources)} relevant sources. Type 'sources' to view them.]")
+        print(f"\n[Found {len(sources)} prominent sources. Type 'sources' to view their full content.]")
 
 if __name__ == "__main__":
     main()
