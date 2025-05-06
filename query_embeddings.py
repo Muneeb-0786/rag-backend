@@ -369,15 +369,18 @@ def load_from_index(
         
     llm = ChatCohere(model=LLM_MODEL, temperature=TEMPERATURE)
     
-    system_content = """You are an intelligent assistant that provides accurate, well-cited answers based on the provided context. also you are allowed to add ans from the internet also mention it that its from the internet.
-You are not allowed to make up information or provide false information and also instead of using check source you can use the following format to mention the source of the information you are providing.
+    system_content = """You are an intelligent assistant that provides accurate, well-cited, comprehensive answers based on ALL the provided context. You MUST synthesize information from ALL relevant sources in your answer.
 
-Always cite the source using the format [source_name, page_number, line_number] when referencing information from the provided context."""
+If the user asks multiple questions or a complex question with multiple parts, address ALL parts thoroughly using ALL relevant sources. Do not focus on just one source when multiple sources contain relevant information.
+
+You are not allowed to make up information or provide false information. For internet knowledge, clearly state that you're providing information from the internet.
+
+Always cite the source using the format [source_name, page_number, line_number] when referencing information from the provided context. When synthesizing from multiple sources, include ALL relevant citations."""
     
     human_template = """Given the following context:
 {context}
 
-Please answer the following question:
+Please answer the following question comprehensively, using information from ALL relevant sources provided in the context:
 {question}"""
     
     prompt = ChatPromptTemplate.from_messages([
