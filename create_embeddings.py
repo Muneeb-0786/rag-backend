@@ -112,6 +112,76 @@ def process_document(file_path, output_dir="indexed_docs", chunk_size=1000, chun
         print(f"Error processing document: {str(e)}")
         return None
 
+def process_multiple_documents(file_paths, output_dir="indexed_docs", chunk_size=1000, chunk_overlap=150, combined_name="combined_index"):
+    """Process multiple documents into a single index, create embeddings, and save the index."""
+    start_time = time.time()
+    
+    try:
+        print(f"Processing {len(file_paths)} documents into a combined index")
+        # Validate parameters
+        validate_chunk_params(chunk_size, chunk_overlap)
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Load and process all documents
+        all_docs = []
+        
+        for file_path in file_paths:
+            try:
+                print(f"Loading document: {file_path}")
+                loader = get_document_loader(file_path)
+                documents = loader.load()
+                
+                if not documents:
+                    print(f"Warning: No content extracted from {file_path}, skipping...")
+                    continue
+                    
+                # Split documents
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+                docs = text_splitter.split_documents(documents)
+                
+                if not docs:
+                    print(f"Warning: Document splitting resulted in no chunks for {file_path}, skipping...")
+                    continue
+                    
+                print(f"Added {len(docs)} chunks from {file_path}")
+                all_docs.extend(docs)
+                
+            except Exception as e:
+                print(f"Error processing {file_path}: {str(e)}")
+                print("Skipping this file but continuing with others...")
+        
+        if not all_docs:
+            raise ValueError("No valid documents or chunks were found")
+            
+        print(f"Combined {len(all_docs)} total chunks from {len(file_paths)} documents")
+        
+        # Define embedding - primary is Cohere
+        try:
+            print("Using Cohere embeddings")
+            embeddings = CohereEmbeddings(model="embed-english-v3.0")
+            
+            # Create vector database from data using FAISS
+            db = FAISS.from_documents(all_docs, embeddings)
+        except Exception as e:
+            raise RuntimeError(f"Error creating embeddings: {str(e)}")
+        
+        # Save the FAISS index
+        save_path = os.path.join(output_dir, combined_name)
+        db.save_local(save_path)
+        
+        end_time = time.time()
+        
+        print(f"Combined index saved to {save_path}")
+        print(f"Combined embedding creation completed in {end_time - start_time:.2f} seconds")
+        
+        return save_path
+        
+    except Exception as e:
+        print(f"Error processing combined documents: {str(e)}")
+        return None
+
 def find_files(paths, recursive=False):
     """Find all files from given paths, optionally recursively."""
     all_files = []
@@ -144,6 +214,8 @@ def main():
     parser.add_argument('--output', '-o', type=str, default="indexed_docs", help='Output directory for saving index')
     parser.add_argument('--chunk-size', type=int, default=1000, help='Chunk size for text splitting')
     parser.add_argument('--chunk-overlap', type=int, default=150, help='Chunk overlap for text splitting')
+    parser.add_argument('--combine', '-c', action='store_true', help='Combine all files into a single index')
+    parser.add_argument('--combined-name', type=str, default="combined_index", help='Name for the combined index')
     
     args = parser.parse_args()
     
@@ -162,6 +234,32 @@ def main():
         print("Error: No input files specified. Use --file or --files options.")
         return 1
     
+    # Check if files exist
+    files_to_process = [f for f in files_to_process if os.path.exists(f)]
+    if not files_to_process:
+        print("Error: None of the specified files exist.")
+        return 1
+    
+    # Process in combined mode if requested
+    if args.combine:
+        print(f"Processing {len(files_to_process)} files in combined mode")
+        save_path = process_multiple_documents(
+            files_to_process,
+            output_dir=args.output,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+            combined_name=args.combined_name
+        )
+        
+        if save_path:
+            print(f"\nSuccessfully created combined index at: {save_path}")
+            print(f"Combined {len(files_to_process)} files into a single index")
+            return 0
+        else:
+            print("\nFailed to create combined index")
+            return 1
+    
+    # Otherwise, process files individually (original behavior)
     # Track processing results
     results = {
         'success': [],
@@ -169,7 +267,7 @@ def main():
     }
     
     total_files = len(files_to_process)
-    print(f"Starting to process {total_files} file(s)")
+    print(f"Starting to process {total_files} file(s) individually")
     
     # Process each file
     for i, file_path in enumerate(files_to_process):
