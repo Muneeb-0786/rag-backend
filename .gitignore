@@ -87,6 +87,7 @@ temp/
 temp_audio/
 sessions/
 uploads/
+indexed_docs/
 # FAISS index backups (keep the main index)
 faiss_index/backup/
 
