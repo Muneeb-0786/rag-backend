@@ -9,6 +9,7 @@ from typing import List, Tuple, Dict
 import time
 import glob
 from langchain_cohere import CohereEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 # Configure API keys
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
@@ -51,6 +52,15 @@ def validate_chunk_params(chunk_size, chunk_overlap):
     if chunk_overlap >= chunk_size:
         raise ValueError("Chunk overlap must be less than chunk size")
     return True
+
+def get_embeddings(use_gemini=True):
+    """Return appropriate embeddings model based on availability."""
+    if use_gemini and GOOGLE_API_KEY:
+        print("Using Gemini embeddings")
+        return GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    else:
+        print("Using Cohere embeddings")
+        return CohereEmbeddings(model="embed-english-v3.0")
 
 def create_vectorstore(docs, embeddings, vector_db_type, save_path):
     """Create a vector store based on specified type."""
@@ -106,10 +116,9 @@ def process_document(file_path, output_dir="indexed_docs", chunk_size=1000, chun
             
         print(f"Split into {len(docs)} chunks")
         
-        # Define embedding - primary is Cohere
+        # Define embedding
         try:
-            print("Using Cohere embeddings")
-            embeddings = CohereEmbeddings(model="embed-english-v3.0")
+            embeddings = get_embeddings(use_gemini=True)
             
             # Create vector database
             save_path = os.path.join(output_dir, file_name)
@@ -174,10 +183,9 @@ def process_multiple_documents(file_paths, output_dir="indexed_docs", chunk_size
             
         print(f"Combined {len(all_docs)} total chunks from {len(file_paths)} documents")
         
-        # Define embedding - primary is Cohere
+        # Define embedding
         try:
-            print("Using Cohere embeddings")
-            embeddings = CohereEmbeddings(model="embed-english-v3.0")
+            embeddings = get_embeddings(use_gemini=True)
             
             # Create vector database
             save_path = os.path.join(output_dir, combined_name)
