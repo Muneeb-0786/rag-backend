@@ -6,6 +6,7 @@ import os
 import argparse
 from typing import List, Tuple
 from langchain_cohere import CohereEmbeddings, ChatCohere
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import LLMChainExtractor
 import textwrap
@@ -43,6 +44,18 @@ os.environ["COHERE_API_KEY"] = COHERE_API_KEY
 def word_wrap(text, width=80):
     """Wrap text to specified width"""
     return "\n".join(textwrap.wrap(text, width=width))
+
+def get_embeddings(use_gemini=True):
+    """Return appropriate embeddings model based on availability."""
+    if use_gemini and GOOGLE_API_KEY and GEMINI_AVAILABLE:
+        print("Using Gemini embeddings")
+        return GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001",
+            google_api_key=GOOGLE_API_KEY  # Pass the API key explicitly
+        )
+    else:
+        print("Using Cohere embeddings")
+        return CohereEmbeddings(model="embed-english-v3.0")
 
 # === Step 2: Query Functions ===
 def augment_query_generated(query, model="gemini-2.0-flash", num_variations=2):
@@ -332,7 +345,7 @@ def load_from_index(
     
     print(f"Using vector store type: {vector_store_type}")
     
-    embeddings = CohereEmbeddings(model="embed-english-v3.0")
+    embeddings = get_embeddings(use_gemini=True)
     
     # Load the appropriate vector store
     if vector_store_type.lower() == "faiss":
