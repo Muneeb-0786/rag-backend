@@ -225,17 +225,8 @@ Please answer the following question:
         retriever = db.as_retriever(search_type=retrieval_type, search_kwargs=search_kwargs)
         print("Using standard retriever")
 
-    # Custom retriever with augmentation and reranking
     if use_reranking or use_augmentation:
         print(f"Using {'augmented queries and ' if use_augmentation else ''}{'reranking' if use_reranking else ''}")
-        original_retriever = retriever
-        
-        # Store the database for custom retrieval
-        if isinstance(db, FAISS):
-            db_instance = db
-        else:
-            db_instance = None
-            print("Warning: Custom retrieval requires FAISS vectorstore")
     
     qa_chain = ConversationalRetrievalChain.from_llm(
         llm=llm,
