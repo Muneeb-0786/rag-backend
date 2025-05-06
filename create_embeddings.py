@@ -1,5 +1,6 @@
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, UnstructuredFileLoader
 import os
 import argparse
@@ -51,7 +52,25 @@ def validate_chunk_params(chunk_size, chunk_overlap):
         raise ValueError("Chunk overlap must be less than chunk size")
     return True
 
-def process_document(file_path, output_dir="indexed_docs", chunk_size=1000, chunk_overlap=150):
+def create_vectorstore(docs, embeddings, vector_db_type, save_path):
+    """Create a vector store based on specified type."""
+    if vector_db_type.lower() == "faiss":
+        print(f"Creating FAISS vector database")
+        db = FAISS.from_documents(docs, embeddings)
+        db.save_local(save_path)
+        return db, save_path
+    elif vector_db_type.lower() == "chroma":
+        print(f"Creating Chroma vector database")
+        # Ensure path exists
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        db = Chroma.from_documents(docs, embeddings, persist_directory=save_path)
+        db.persist()
+        return db, save_path
+    else:
+        raise ValueError(f"Unsupported vector database type: {vector_db_type}")
+
+def process_document(file_path, output_dir="indexed_docs", chunk_size=1000, chunk_overlap=150, vector_db_type="faiss"):
     """Process document, create embeddings, and save the index."""
     start_time = time.time()
     
@@ -92,14 +111,12 @@ def process_document(file_path, output_dir="indexed_docs", chunk_size=1000, chun
             print("Using Cohere embeddings")
             embeddings = CohereEmbeddings(model="embed-english-v3.0")
             
-            # Create vector database from data using FAISS
-            db = FAISS.from_documents(docs, embeddings)
+            # Create vector database
+            save_path = os.path.join(output_dir, file_name)
+            db, save_path = create_vectorstore(docs, embeddings, vector_db_type, save_path)
+            
         except Exception as e:
             raise RuntimeError(f"Error creating embeddings: {str(e)}")
-        
-        # Save the FAISS index
-        save_path = os.path.join(output_dir, file_name)
-        db.save_local(save_path)
         
         end_time = time.time()
         
@@ -112,7 +129,7 @@ def process_document(file_path, output_dir="indexed_docs", chunk_size=1000, chun
         print(f"Error processing document: {str(e)}")
         return None
 
-def process_multiple_documents(file_paths, output_dir="indexed_docs", chunk_size=1000, chunk_overlap=150, combined_name="combined_index"):
+def process_multiple_documents(file_paths, output_dir="indexed_docs", chunk_size=1000, chunk_overlap=150, combined_name="combined_index", vector_db_type="faiss"):
     """Process multiple documents into a single index, create embeddings, and save the index."""
     start_time = time.time()
     
@@ -162,14 +179,12 @@ def process_multiple_documents(file_paths, output_dir="indexed_docs", chunk_size
             print("Using Cohere embeddings")
             embeddings = CohereEmbeddings(model="embed-english-v3.0")
             
-            # Create vector database from data using FAISS
-            db = FAISS.from_documents(all_docs, embeddings)
+            # Create vector database
+            save_path = os.path.join(output_dir, combined_name)
+            db, save_path = create_vectorstore(all_docs, embeddings, vector_db_type, save_path)
+            
         except Exception as e:
             raise RuntimeError(f"Error creating embeddings: {str(e)}")
-        
-        # Save the FAISS index
-        save_path = os.path.join(output_dir, combined_name)
-        db.save_local(save_path)
         
         end_time = time.time()
         
@@ -216,6 +231,8 @@ def main():
     parser.add_argument('--chunk-overlap', type=int, default=150, help='Chunk overlap for text splitting')
     parser.add_argument('--combine', '-c', action='store_true', help='Combine all files into a single index')
     parser.add_argument('--combined-name', type=str, default="combined_index", help='Name for the combined index')
+    parser.add_argument('--vector-db', type=str, choices=['faiss', 'chroma'], default='faiss', 
+                       help='Vector database type to use (faiss or chroma)')
     
     args = parser.parse_args()
     
@@ -248,7 +265,8 @@ def main():
             output_dir=args.output,
             chunk_size=args.chunk_size,
             chunk_overlap=args.chunk_overlap,
-            combined_name=args.combined_name
+            combined_name=args.combined_name,
+            vector_db_type=args.vector_db
         )
         
         if save_path:
@@ -283,7 +301,8 @@ def main():
                 file_path, 
                 output_dir=args.output,
                 chunk_size=args.chunk_size,
-                chunk_overlap=args.chunk_overlap
+                chunk_overlap=args.chunk_overlap,
+                vector_db_type=args.vector_db
             )
             
             if save_path:
