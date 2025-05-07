@@ -10,6 +10,8 @@ import time
 import glob
 from langchain_cohere import CohereEmbeddings
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from fastapi import FastAPI, HTTPException, UploadFile, Form
+import shutil
 
 # Configure API keys
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
@@ -27,6 +29,8 @@ if not GOOGLE_API_KEY:
     print("Warning: GEMINI_API_KEY not found. Using Cohere embeddings only.")
 else:
     os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
+
+app = FastAPI()
 
 def get_document_loader(file_path):
     """Return appropriate document loader based on file extension."""
@@ -227,6 +231,78 @@ def find_files(paths, recursive=False):
             all_files.extend([f for f in matches if os.path.isfile(f)])
     
     return all_files
+
+@app.post("/process-document")
+async def process_document_endpoint(
+    file: UploadFile,
+    output_dir: str = Form("indexed_docs"),
+    chunk_size: int = Form(1000),
+    chunk_overlap: int = Form(150),
+    vector_db_type: str = Form("faiss")
+):
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        file_path = os.path.join(output_dir, file.filename)
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        
+        save_path = process_document(
+            file_path=file_path,
+            output_dir=output_dir,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            vector_db_type=vector_db_type
+        )
+        if save_path:
+            return {"message": f"Document processed successfully. Index saved at {save_path}"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to process document.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
+
+@app.post("/process-multiple-documents")
+async def process_multiple_documents_endpoint(
+    files: List[UploadFile],
+    output_dir: str = Form("indexed_docs"),
+    chunk_size: int = Form(1000),
+    chunk_overlap: int = Form(150),
+    combined_name: str = Form("combined_index"),
+    vector_db_type: str = Form("faiss")
+):
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        file_paths = []
+        for file in files:
+            file_path = os.path.join(output_dir, file.filename)
+            with open(file_path, "wb") as f:
+                shutil.copyfileobj(file.file, f)
+            file_paths.append(file_path)
+        
+        save_path = process_multiple_documents(
+            file_paths=file_paths,
+            output_dir=output_dir,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            combined_name=combined_name,
+            vector_db_type=vector_db_type
+        )
+        if save_path:
+            return {"message": f"Documents processed successfully. Combined index saved at {save_path}"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to process documents.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing documents: {str(e)}")
+
+@app.get("/list-indices")
+async def list_indices(output_dir: str = "indexed_docs"):
+    try:
+        if not os.path.exists(output_dir):
+            raise HTTPException(status_code=400, detail="Output directory does not exist.")
+        
+        indices = [name for name in os.listdir(output_dir) if os.path.isdir(os.path.join(output_dir, name))]
+        return {"indices": indices}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing indices: {str(e)}")
 
 def main():
     """Main CLI function."""
