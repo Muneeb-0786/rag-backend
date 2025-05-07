@@ -116,9 +116,6 @@ def detect_vector_store_type(index_path: str) -> str:
     # Otherwise, assume FAISS (which typically has a .faiss extension file)
     return "faiss"
 
-# Add import for visualization
-from visualize_chunks import visualize_query_and_chunks
-
 def retrieve_and_rerank_documents(db, query, n_results=5, max_return=5, use_augmentation=True, model="cross-encoder/ms-marco-MiniLM-L-6-v2"):
     """Retrieve relevant documents for a given query using multiple query expansion and reranking"""
     augmented_queries = None
@@ -235,60 +232,6 @@ def retrieve_and_rerank_documents(db, query, n_results=5, max_return=5, use_augm
             if len(reranked_doc_objects) > 0:
                 is_reranked = True
             
-            # Get indices for the prominent chunks (for visualization)
-            prominent_indices = []
-            for doc in reranked_doc_objects:
-                try:
-                    idx = all_doc_objects.index(doc)
-                    prominent_indices.append(idx)
-                except ValueError:
-                    pass
-            
-            print(f"\nReturning top {max_return} documents based on reranking.")
-            
-            # Visualize the query and chunks - only if we have embeddings
-            if query_embedding is not None and all_embeddings and len(all_embeddings) > 0:
-                try:
-                    # Debug info
-                    print(f"Visualization: query_embedding shape: {np.array(query_embedding).shape}")
-                    print(f"Visualization: all_embeddings length: {len(all_embeddings)}")
-                    if augmented_embeddings:
-                        print(f"Visualization: augmented_embeddings length: {len(augmented_embeddings)}")
-                    
-                    # Fix: Convert embeddings to numpy arrays if needed
-                    if not isinstance(query_embedding, np.ndarray):
-                        query_embedding = np.array(query_embedding)
-                    
-                    visualization_result = visualize_query_and_chunks(
-                        query, 
-                        query_embedding, 
-                        all_doc_objects, 
-                        np.array(all_embeddings), 
-                        prominent_indices,
-                        use_gemini=True,
-                        augmented_queries=augmented_queries,
-                        is_reranked=is_reranked,
-                        augmented_embeddings=augmented_embeddings if len(augmented_embeddings) > 0 else None
-                    )
-                    
-                    if visualization_result:
-                        print(f"Visualization created successfully")
-                        if visualization_result.get("tsne_file"):
-                            print(f"TSNE visualization: {visualization_result['tsne_file']}")
-                        if visualization_result.get("gemini_file"):
-                            print(f"Gemini visualization: {visualization_result['gemini_file']}")
-                        
-                        # Print info about which queries influenced which chunks
-                        if augmented_queries and len(augmented_queries) > 0:
-                            print("\nAugmented Query Influence:")
-                            for q_idx, docs in query_to_docs.items():
-                                if q_idx == 0:
-                                    print(f"Original query retrieved {len(docs)} documents")
-                                elif q_idx-1 < len(augmented_queries):
-                                    print(f"Augmented query {q_idx}: \"{augmented_queries[q_idx-1][:50]}...\" retrieved {len(docs)} documents")
-                except Exception as e:
-                    print(f"Visualization error: {e}")
-            
             return reranked_doc_objects
         except Exception as e:
             print(f"Error during reranking: {e}")
@@ -300,29 +243,6 @@ def retrieve_and_rerank_documents(db, query, n_results=5, max_return=5, use_augm
         # For visualization without reranking, just use the top chunks
         prominent_indices = list(range(min(max_return, len(unique_doc_objects))))
         
-        # Visualize the query and chunks - only if we have embeddings
-        if query_embedding is not None and all_embeddings and len(all_embeddings) > 0:
-            try:
-                visualization_result = visualize_query_and_chunks(
-                    query, 
-                    query_embedding, 
-                    all_doc_objects, 
-                    np.array(all_embeddings), 
-                    prominent_indices,
-                    use_gemini=True,
-                    augmented_queries=augmented_queries,
-                    is_reranked=False  # No reranking applied
-                )
-                
-                if visualization_result:
-                    print(f"Visualization created successfully")
-                    if visualization_result.get("tsne_file"):
-                        print(f"TSNE visualization: {visualization_result['tsne_file']}")
-                    if visualization_result.get("gemini_file"):
-                        print(f"Gemini visualization: {visualization_result['gemini_file']}")
-            except Exception as e:
-                print(f"Visualization error: {e}")
-            
         return unique_doc_objects[:max_return]
 
 def load_from_index(
@@ -536,39 +456,7 @@ class IndexChat:
                     
                     # Only visualize if we have embeddings
                     if query_embedding is not None and len(all_embeddings) > 0:
-                        # Debug info
-                        print(f"Standard path: query_embedding shape: {np.array(query_embedding).shape}")
-                        print(f"Standard path: all_embeddings length: {len(all_embeddings)}")
-                        if augmented_embeddings:
-                            print(f"Standard path: augmented_embeddings length: {len(augmented_embeddings)}")
-                        
-                        # Fix: Convert embeddings to numpy arrays if needed
-                        if not isinstance(query_embedding, np.ndarray):
-                            query_embedding = np.array(query_embedding)
-                        
-                        try:
-                            visualization_result = visualize_query_and_chunks(
-                                question, 
-                                query_embedding, 
-                                all_docs, 
-                                np.array(all_embeddings), 
-                                prominent_indices,
-                                use_gemini=True,
-                                augmented_queries=augmented_queries,
-                                is_reranked=False,  # Standard retrieval doesn't use reranking
-                                augmented_embeddings=augmented_embeddings if augmented_embeddings and len(augmented_embeddings) > 0 else None
-                            )
-                            
-                            if visualization_result:
-                                print(f"Visualization created successfully")
-                                if visualization_result.get("tsne_file"):
-                                    print(f"TSNE visualization: {visualization_result['tsne_file']}")
-                                if visualization_result.get("gemini_file"):
-                                    print(f"Gemini visualization: {visualization_result['gemini_file']}")
-                        except Exception as e:
-                            print(f"Visualization specific error: {e}")
-                            import traceback
-                            traceback.print_exc()
+                        pass
                     else:
                         print("Visualization skipped - embedding function not available")
                 else:
