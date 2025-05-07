@@ -718,3 +718,83 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+from fastapi import FastAPI, HTTPException, UploadFile, Form, Body
+from fastapi.responses import JSONResponse
+from typing import List, Optional
+import os
+import shutil
+
+app = FastAPI()
+
+# Global variables to manage loaded indices and chat sessions
+loaded_index = None
+chat_instance = None
+
+@app.post("/load-index")
+async def load_index(
+    index_path: str = Body(...),
+    retrieval_type: str = Body("similarity"),
+    chain_type: str = Body("stuff"),
+    k: int = Body(4),
+    fetch_k: int = Body(20),
+    lambda_mult: float = Body(0.5),
+    use_compression: bool = Body(False),
+    use_reranking: bool = Body(False),
+    use_augmentation: bool = Body(False),
+    n_results: int = Body(10),
+    max_return: int = Body(5),
+    vector_store_type: Optional[str] = Body(None)
+):
+    global loaded_index, chat_instance
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=400, detail="Index path does not exist.")
+    
+    try:
+        chat_instance = IndexChat(
+            index_path=index_path,
+            retrieval_type=retrieval_type,
+            chain_type=chain_type,
+            k=k,
+            fetch_k=fetch_k,
+            lambda_mult=lambda_mult,
+            use_compression=use_compression,
+            use_reranking=use_reranking,
+            use_augmentation=use_augmentation,
+            n_results=n_results,
+            max_return=max_return,
+            vector_store_type=vector_store_type
+        )
+        loaded_index = index_path
+        return {"message": f"Index loaded successfully from {index_path}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error loading index: {str(e)}")
+
+@app.post("/ask")
+async def ask_question(payload: dict = Body(...)):
+    global chat_instance
+    if not chat_instance:
+        raise HTTPException(status_code=400, detail="No index loaded. Load an index first.")
+    
+    try:
+        question = payload.get("question")
+        if not question:
+            raise HTTPException(status_code=400, detail="The 'question' field is required.")
+        
+        answer, generated_question, sources = chat_instance.ask(question)
+        return {
+            "answer": answer,
+            "generated_question": generated_question,
+            "sources": [{"content": doc.page_content, "metadata": doc.metadata} for doc in sources]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
+
+@app.post("/reset-chat")
+async def reset_chat():
+    global chat_instance
+    if not chat_instance:
+        raise HTTPException(status_code=400, detail="No index loaded. Load an index first.")
+    
+    chat_instance.reset_chat()
+    return {"message": "Chat history has been reset."}
