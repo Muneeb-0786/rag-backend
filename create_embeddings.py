@@ -36,6 +36,8 @@ def get_document_loader(file_path):
         return PyPDFLoader(file_path)
     elif file_ext == '.txt':
         return TextLoader(file_path)
+    elif file_ext == '.mdx':  # Add support for MDX files
+        return TextLoader(file_path)  # Treat MDX as plain text for now
     else:
         # Try to use UnstructuredFileLoader for other file types
         try:
