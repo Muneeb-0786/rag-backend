@@ -493,99 +493,51 @@ class IndexChat:
             generated_question = result.get("generated_question", question)
             source_documents = result["source_documents"]
             
-            # Try to get query embedding for visualization
-            query_embedding = None
-            all_embeddings = []
-            all_docs = []
+            # Generate code snippet if applicable
+            code_snippet = None
+            if "code" in question.lower():
+                code_snippet = self.generate_code_snippet(answer)
             
-            try:
-                if hasattr(self.db, 'embedding_function'):
-                    # Get query embedding
-                    query_embedding = self.db.embedding_function.embed_query(question)
-                    
-                    # Get all documents for visualization (increase sample size)
-                    all_docs = self.db.similarity_search(question, k=30)  # Increased from 20
-                    
-                    # Get embeddings for all documents
-                    for doc in all_docs:
-                        all_embeddings.append(self.db.embedding_function.embed_query(doc.page_content))
-                    
-                    # Mark the prominent documents (those actually returned by the retriever)
-                    prominent_indices = []
-                    for doc in source_documents:
-                        for i, all_doc in enumerate(all_docs):
-                            if doc.page_content == all_doc.page_content:
-                                prominent_indices.append(i)
-                                break
-                    
-                    # Get augmented queries if augmentation is enabled
-                    augmented_queries = None
-                    augmented_embeddings = None
-                    if self.use_augmentation:
-                        augmented_queries = augment_query_generated(question)
-                        
-                        # Get embeddings for augmented queries
-                        if augmented_queries:
-                            augmented_embeddings = []
-                            for aug_query in augmented_queries:
-                                try:
-                                    aug_emb = self.db.embedding_function.embed_query(aug_query)
-                                    augmented_embeddings.append(aug_emb)
-                                except Exception as e:
-                                    print(f"Could not embed augmented query: {e}")
-                    
-                    # Only visualize if we have embeddings
-                    if query_embedding is not None and len(all_embeddings) > 0:
-                        # Debug info
-                        print(f"Standard path: query_embedding shape: {np.array(query_embedding).shape}")
-                        print(f"Standard path: all_embeddings length: {len(all_embeddings)}")
-                        if augmented_embeddings:
-                            print(f"Standard path: augmented_embeddings length: {len(augmented_embeddings)}")
-                        
-                        # Fix: Convert embeddings to numpy arrays if needed
-                        if not isinstance(query_embedding, np.ndarray):
-                            query_embedding = np.array(query_embedding)
-                        
-                        try:
-                            visualization_result = visualize_query_and_chunks(
-                                question, 
-                                query_embedding, 
-                                all_docs, 
-                                np.array(all_embeddings), 
-                                prominent_indices,
-                                use_gemini=True,
-                                augmented_queries=augmented_queries,
-                                is_reranked=False,  # Standard retrieval doesn't use reranking
-                                augmented_embeddings=augmented_embeddings if augmented_embeddings and len(augmented_embeddings) > 0 else None
-                            )
-                            
-                            if visualization_result:
-                                print(f"Visualization created successfully")
-                                if visualization_result.get("tsne_file"):
-                                    print(f"TSNE visualization: {visualization_result['tsne_file']}")
-                                if visualization_result.get("gemini_file"):
-                                    print(f"Gemini visualization: {visualization_result['gemini_file']}")
-                        except Exception as e:
-                            print(f"Visualization specific error: {e}")
-                            import traceback
-                            traceback.print_exc()
-                    else:
-                        print("Visualization skipped - embedding function not available")
-                else:
-                    print("Visualization skipped - embedding function not available")
-            except Exception as e:
-                print(f"Visualization error (non-critical): {e}")
-                import traceback
-                traceback.print_exc()
+            # Append references to the source documents
+            references = "\n".join(
+                f"[Source: {doc.metadata.get('source', 'Unknown')}, Line: {doc.metadata.get('line_number', 'N/A')}]"
+                for doc in source_documents
+            )
+            answer_with_references = f"{answer}\n\nReferences:\n{references}"
             
-            self.chat_history.append((question, answer))
+            self.chat_history.append((question, answer_with_references))
             if len(self.chat_history) > 5:
                 self.chat_history = self.chat_history[-5:]
             
-            return answer, generated_question, source_documents
+            return answer_with_references, generated_question, source_documents
         except Exception as e:
             print(f"Error in QA process: {e}")
             return "I encountered an error processing your question. Please try again.", question, []
+
+    def generate_code_snippet(self, answer: str) -> str:
+        """Generate a code snippet based on the answer using Cohere."""
+        try:
+            llm = ChatCohere(model=LLM_MODEL, temperature=0.1)
+            prompt = f"""Based on the following answer, generate a Python code snippet that implements the described functionality.
+            Make the code well-documented, efficient, and follow best practices.
+            
+            Answer: {answer}
+            
+            Return ONLY the code snippet without any explanation before or after it. The code should be complete and executable."""
+            
+            response = llm.invoke(prompt)
+            code_text = response.content
+            
+            # Extract code if it's wrapped in markdown code blocks
+            if "```python" in code_text and "```" in code_text:
+                code_text = code_text.split("```python")[1].split("```")[0]
+            elif "```" in code_text:
+                code_text = code_text.split("```")[1].split("```")[0]
+                
+            return f"# Generated code snippet:\n{code_text.strip()}"
+        except Exception as e:
+            print(f"Error generating code snippet: {e}")
+            return "# Could not generate code snippet due to an error"
 
     def reset_chat(self):
         self.chat_history = []
